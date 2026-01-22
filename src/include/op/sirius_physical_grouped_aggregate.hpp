@@ -24,6 +24,8 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "cudf/types.hpp"
+#include "cudf/aggregation.hpp"
 
 namespace sirius {
 namespace op {
@@ -89,11 +91,13 @@ std::vector<int> cudf_aggregate_idx;
     return duckdb::OrderPreservationType::NO_ORDER;
   }
 
- public:
   // Sink interface
   bool is_sink() const override { return true; }
 
   bool sink_order_dependent() const override { return false; }
+
+  std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

@@ -22,6 +22,7 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_column_data_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_dummy_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_partition.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_partition_consumer_operator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_concat.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_limit.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_delim_join.cpp

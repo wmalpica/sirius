@@ -33,7 +33,7 @@ class sirius_physical_partition_consumer_operator : public sirius_physical_opera
   {
   }
 
-  virtual ~sirius_physical_partition_consumer_operator() {}
+  virtual ~sirius_physical_partition_consumer_operator();
 
   //! Push a data batch to a specific port with partition information
   //! @param port_id The port identifier

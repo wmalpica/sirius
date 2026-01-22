@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "creator/task_creator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
@@ -23,6 +24,8 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 namespace sirius {
 namespace op {
@@ -31,7 +34,7 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
                                                      duckdb::idx_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build)
-  : sirius_physical_operator(
+  : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
@@ -106,28 +109,38 @@ bool sirius_physical_partition::is_build_partition() { return _is_build; }
 
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override {
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
+
+    // assert that we have only one input batch
+    if (input_batches.size() != 1) {
+      throw std::runtime_error("We expect only one input batch for partition operator");
+    }
+
+    auto input_batch = input_batches[0];
 
     std::vector<std::shared_ptr<cucascade::data_batch>>  partitioned_results;
     switch (_partition_type) {
       case PartitionType::HASH:
-      partitioned_results = gpu_partition_impl::hash_partition(input_batches, _partition_keys, _num_partitions);
+      partitioned_results = gpu_partition_impl::hash_partition(input_batch, _partition_keys, _num_partitions, cudf::get_default_stream(),
+      *input_batch->get_memory_space());
       case PartitionType::RANGE:
         throw std::runtime_error("Range partitioning is not implemented yet");
       case PartitionType::EVENLY:
-      partitioned_results = gpu_partition_impl::evenly_partition(input_batches, _partition_keys, _num_partitions);
+      partitioned_results = gpu_partition_impl::evenly_partition(input_batch, _num_partitions, cudf::get_default_stream(),
+      *input_batch->get_memory_space());
       case PartitionType::CUSTOM:
         throw std::runtime_error("Custom partitioning is not implemented yet");
       default:
-        throw std::runtime_error("Unsupported partition type: " + std::to_string(_partition_type));
+        throw std::runtime_error("Unsupported partition type: " + partition_type_to_string(_partition_type));
   }
 
-  return {};
+  return partitioned_results;
 }
 
-void sirius_physical_partition::sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override {
+void sirius_physical_partition::sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
   
-  for (auto& batch : output_batches) {
+  int partition_id = 0;
+  for (auto& batch : input_batches) {
     for (auto& [next_op, port_id] : next_port_after_sink) {
       // the next operator is a partition consumer operator, so we need to push the batch into the specific partition
       auto partition_consumer_op = dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
@@ -137,6 +150,7 @@ void sirius_physical_partition::sink(const std::vector<std::shared_ptr<::cucasca
         throw std::runtime_error("Next operator is not a partition consumer operator");
       }
     }
+    partition_id++;
   }
 
   if (!creator) {

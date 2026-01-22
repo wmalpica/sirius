@@ -254,7 +254,7 @@ class sirius_physical_operator {
 
   void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
- private:
+ protected:
   duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;

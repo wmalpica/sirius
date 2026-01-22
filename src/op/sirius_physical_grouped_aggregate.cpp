@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/gpu_aggregate_impl.hpp"
 
 namespace sirius {
 namespace op {
@@ -215,7 +216,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 }
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override {
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
 
     std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {
