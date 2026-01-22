@@ -159,7 +159,78 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
     total_output_columns++;
   }
   total_output_columns += grouped_aggregate_data.GroupCount();
+
+
+
+// Convert the grouped aggregate data to cudf compute definitions
+  {
+    // 1. Extract group_idx from grouped_aggregate_data.groups
+    for (const auto& group : grouped_aggregate_data.groups) {
+      D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
+      auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
+      group_idx.push_back(static_cast<int>(bound_ref.index));
+    }
+
+    // 2. Extract aggregates (cudf::aggregation::Kind) from grouped_aggregate_data.aggregates
+    for (const auto& aggregate : grouped_aggregate_data.aggregates) {
+      auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
+      
+      // Convert DuckDB aggregate function name to cudf::aggregation::Kind
+      cudf::aggregation::Kind agg_kind;
+      if (aggr.function.name == "sum" || aggr.function.name == "sum_no_overflow") {
+        agg_kind = cudf::aggregation::Kind::SUM;
+      } else if (aggr.function.name == "count") {
+        agg_kind = cudf::aggregation::Kind::COUNT_VALID;
+      } else if (aggr.function.name == "count_star") {
+        agg_kind = cudf::aggregation::Kind::COUNT_ALL;
+      } else if (aggr.function.name == "min") {
+        agg_kind = cudf::aggregation::Kind::MIN;
+      } else if (aggr.function.name == "max") {
+        agg_kind = cudf::aggregation::Kind::MAX;
+      } else {
+        throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name);
+      }
+      cudf_aggregates.push_back(agg_kind);
+      
+      // 3. Extract aggregate_idx from the children of the aggregate expression
+      if (aggr.children.empty()) {
+        // COUNT(*) has no children - use 0 as a placeholder (will be handled by COUNT_ALL)
+        if (aggr.function.name == "count_star") {
+          cudf_aggregate_idx.push_back(0);
+        } else {
+          throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with no children");
+        }
+      } else {
+        if (aggr.children.size() == 1) {
+          // Extract the column index from the first child (most aggregates have one child)
+          D_ASSERT(aggr.children[0]->type == duckdb::ExpressionType::BOUND_REF);
+          auto& bound_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
+          cudf_aggregate_idx.push_back(static_cast<int>(bound_ref.index));
+        } else {
+          throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with " + std::to_string(aggr.children.size()) + " children");
+        }
+      }
+    }
+  }
 }
 
+std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate::execute(
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override {
+
+    std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  for (auto& input_batch : input_batches) {
+    auto result = gpu_aggregate_impl::local_grouped_aggregate(
+      input_batch,
+      group_idx,
+      cudf_aggregates,
+      cudf_aggregate_idx,
+      cudf::get_default_stream(),
+      *input_batch->get_memory_space()
+    );
+    results.push_back(std::move(result));
+  
+  }
+  return results;
+}
 }  // namespace op
 }  // namespace sirius

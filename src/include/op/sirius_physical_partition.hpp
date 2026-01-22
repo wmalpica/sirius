@@ -29,6 +29,14 @@
 namespace sirius {
 namespace op {
 
+  enum class PartitionType {
+    HASH,
+    RANGE,
+    EVENLY,
+    CUSTOM,
+    NONE
+  };
+
 class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
@@ -50,11 +58,12 @@ class sirius_physical_partition : public sirius_physical_operator {
   sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
  private:
-  void get_partition_keys(sirius_physical_operator* op, bool is_build = false);
+  void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
   sirius_physical_operator* _parent_op;
   duckdb::vector<duckdb::idx_t> _partition_keys;
   duckdb::idx_t _num_partitions;
   bool _is_build;
+  PartitionType _partition_type;
 };
 
 }  // namespace op

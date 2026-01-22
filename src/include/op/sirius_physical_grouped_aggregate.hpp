@@ -74,6 +74,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
 
+// Grouped aggregatge definitions for cudf compute
+std::vector<int> group_idx;
+std::vector<cudf::aggregation::Kind> cudf_aggregates;
+std::vector<int> cudf_aggregate_idx;
+
+
  public:
   // Source interface
   bool is_source() const override { return true; }
