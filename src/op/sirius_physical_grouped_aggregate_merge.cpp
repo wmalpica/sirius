@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
 
 namespace sirius {
 namespace op {
@@ -84,6 +85,32 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
       duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)  // default
 {
   child_op = grouped_aggregate;
+sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
+  duckdb::ClientContext& context,
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::idx_t estimated_cardinality)
+  : sirius_physical_grouped_aggregate_merge(
+      context, std::move(types), std::move(expressions), {}, estimated_cardinality)
+{
+}
+
+sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
+  duckdb::ClientContext& context,
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::idx_t estimated_cardinality)
+  : sirius_physical_grouped_aggregate_merge(context,
+                                      std::move(types),
+                                      std::move(expressions),
+                                      std::move(groups_p),
+                                      {},
+                                      {},
+                                      estimated_cardinality,
+                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)
+{
 }
 
 // expressions is the list of aggregates to be computed. Each aggregates has a bound_ref expression
@@ -94,6 +121,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 // the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
 // grouping set and the second level is the indexes to the groupby expression for that set.
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
+  duckdb::ClientContext& context,
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
@@ -106,6 +134,9 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
+  // WSM TODO: refactor this so that its less redundant with sirius_physical_grouped_aggregate.cpp
+// Need to first figure out what we actually need and how things look when we run a real query
+
   // get a list of all aggregates to be computed
   const duckdb::idx_t group_count = groups_p.size();
   if (grouping_sets.empty()) {
@@ -173,7 +204,103 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
     total_output_columns++;
   }
   total_output_columns += grouped_aggregate_data.GroupCount();
+
+
+
+// Convert the grouped aggregate data to cudf compute definitions
+  {
+    // 1. Extract group_idx from grouped_aggregate_data.groups
+    for (const auto& group : grouped_aggregate_data.groups) {
+      D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
+      auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
+      group_idx.push_back(static_cast<int>(bound_ref.index));
+    }
+
+    // 2. Extract aggregates (cudf::aggregation::Kind) from grouped_aggregate_data.aggregates
+    for (const auto& aggregate : grouped_aggregate_data.aggregates) {
+      auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
+      
+      // Convert DuckDB aggregate function name to cudf::aggregation::Kind
+      cudf::aggregation::Kind agg_kind;
+      if (aggr.function.name == "sum" || aggr.function.name == "sum_no_overflow") {
+        agg_kind = cudf::aggregation::Kind::SUM;
+      } else if (aggr.function.name == "count") {
+        agg_kind = cudf::aggregation::Kind::COUNT_VALID;
+      } else if (aggr.function.name == "count_star") {
+        agg_kind = cudf::aggregation::Kind::COUNT_ALL;
+      } else if (aggr.function.name == "min") {
+        agg_kind = cudf::aggregation::Kind::MIN;
+      } else if (aggr.function.name == "max") {
+        agg_kind = cudf::aggregation::Kind::MAX;
+      } else {
+        throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name);
+      }
+      cudf_aggregates.push_back(agg_kind);
+      
+      // 3. Extract aggregate_idx from the children of the aggregate expression
+      if (aggr.children.empty()) {
+        // COUNT(*) has no children - use 0 as a placeholder (will be handled by COUNT_ALL)
+        if (aggr.function.name == "count_star") {
+          cudf_aggregate_idx.push_back(0);
+        } else {
+          throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with no children");
+        }
+      } else {
+        if (aggr.children.size() == 1) {
+          // Extract the column index from the first child (most aggregates have one child)
+          D_ASSERT(aggr.children[0]->type == duckdb::ExpressionType::BOUND_REF);
+          auto& bound_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
+          cudf_aggregate_idx.push_back(static_cast<int>(bound_ref.index));
+        } else {
+          throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with " + std::to_string(aggr.children.size()) + " children");
+        }
+      }
+    }
+  }
 }
 
+std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate_merge::get_input_batch()
+{
+
+  // WSM TODO: we need to make sure this gets called after all the previous partitioning operator tasks have completed
+  // we need to lock, then pull all the batches from one partition and return them, and increment the partition index
+  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+  
+    std::lock_guard<std::mutex> lg(lock);
+    if (current_partition_index < ports[0]->repo->num_partitions()) {
+      bool found_batch = true;
+      while (found_batch) {
+        auto batch = ports[0]->repo->pop_data_batch(::cucascade::batch_state::task_created, current_partition_index);
+        if (batch) {
+          input_batch.push_back(std::move(batch));
+        } else {
+          found_batch = false;
+        }
+      }
+      current_partition_index++;
+      return input_batch; 
+    } else {
+      return std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
+    }
+}
+
+
+std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate_merge::execute(
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
+
+    if (input_batches.size() == 0) {
+      throw std::runtime_error("We expect at least one input batch for grouped aggregate merge operator");
+    }
+
+    auto result = gpu_merge_impl::merge_grouped_aggregate(
+      input_batches,
+      group_idx.size(),
+      cudf_aggregates,
+      cudf::get_default_stream(),
+      *input_batches[0]->get_memory_space()
+    );
+    
+    return {result};
+}
 }  // namespace op
 }  // namespace sirius
