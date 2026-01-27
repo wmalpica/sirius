@@ -164,7 +164,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   group_idx = std::move(cudf_defs.group_idx);
   cudf_aggregates = std::move(cudf_defs.cudf_aggregates);
   cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
- 
 }
  
 std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate_merge::get_input_batch()

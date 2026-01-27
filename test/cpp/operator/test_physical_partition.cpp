@@ -16,14 +16,13 @@
 
  #include "operator_test_utils.hpp"
  #include "operator_type_traits.hpp"
+ #include "utils/aggregate_test_utils.hpp"
  
  #include <catch.hpp>
  #include <op/sirius_physical_partition.hpp>
  #include "op/sirius_physical_grouped_aggregate_merge.hpp"
  
  #include <duckdb.hpp>
- #include <duckdb/catalog/catalog.hpp>
- #include <duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp>
  #include <duckdb/parser/query_error_context.hpp>
  #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
  #include <duckdb/planner/expression/bound_reference_expression.hpp>
@@ -39,16 +38,6 @@
  
  using namespace sirius::test::operator_utils;
  }  // namespace
-
- // Helper to create a dummy AggregateFunction since we only need the name and types for the GPU
-// operator
-AggregateFunction MakeDummyAggregate(const std::string& name,
-  const duckdb::vector<LogicalType>& args,
-  const LogicalType& ret_type)
-{
-return AggregateFunction(
-name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-}
  
  TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single partition key",
                     "[physical_partition]",
@@ -117,7 +106,7 @@ name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, n
    // Concatenate the two batches horizontally (side by side columns)
    auto input_batch = concatenate_batches_horizontal({input_batch0, input_batch1}, *space);
 
-   std::cout<<"gen input batches"<<std::endl;
+   // this cardinality is not real, we are setting here this large in order to force more partitions to be made
    std::size_t estimated_cardinality = 100000000; // 100 million rows = PARTITION_SIZE x 10
  
    // Create DuckDB context for aggregate function binding
@@ -125,61 +114,23 @@ name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, n
    duckdb::Connection con(db);
    auto& context = *con.context;
 
-   std::cout<<"gen context"<<std::endl;
+   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
+   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
+     {0},      // group_indexes: GROUP BY column 0
+     {"sum"},  // aggregations: SUM
+     {1}       // agg_indexes: SUM(column 1)
+   );
 
-   // Create output types: [group_by_column_type, sum_result_type]
-   duckdb::vector<duckdb::LogicalType> agg_output_types;
-   agg_output_types.push_back(Traits::logical_type()); // group by key type
-   agg_output_types.push_back(Traits::logical_type()); // sum result type
-
-   std::cout<<"gen agg output types"<<std::endl;
-
-   // Create group by expression: GROUP BY column 0
-   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
-   groups.push_back(
-     duckdb::make_uniq<duckdb::BoundReferenceExpression>(Traits::logical_type(), 0));
-
-   std::cout<<"gen groups"<<std::endl;
-
-   // Create aggregate expression: SUM(column 0)
-   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
-   
-       
-   std::cout<<"gen sum function"<<std::endl;
-
-   // Create children for the aggregate (the column to sum)
-   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> sum_children;
-   sum_children.push_back(
-     duckdb::make_uniq<duckdb::BoundReferenceExpression>(Traits::logical_type(), 1));
-   
-   std::cout<<"gen sum children"<<std::endl;
-
-   AggregateFunction sum_function = MakeDummyAggregate("sum", {Traits::logical_type()}, Traits::logical_type());
-
-   // Create the BoundAggregateExpression for SUM
-   auto sum_aggregate = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
-     sum_function,
-     std::move(sum_children),
-     nullptr, // filter
-     nullptr, // bind_info
-     duckdb::AggregateType::NON_DISTINCT);
-   
-   std::cout<<"gen sum aggregate"<<std::endl;
-
-   aggregates.push_back(std::move(sum_aggregate));
-
-   std::cout<<"finish arg setup"<<std::endl;
+   // Create partitioner types (copy of agg_output_types before moving)
+   duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
 
    // Create the grouped aggregate merge operator
    sirius_physical_grouped_aggregate_merge grouped_aggregator(
      context,
-     std::move(agg_output_types),
-     std::move(aggregates),
-     std::move(groups),
+     std::move(agg_result.output_types),
+     std::move(agg_result.aggregates),
+     std::move(agg_result.groups),
      estimated_cardinality);
-
-   // Create partitioner types (just the group by key for partitioning)
-   duckdb::vector<duckdb::LogicalType> partitioner_types = agg_output_types;
    
    sirius_physical_partition partitioner(
      std::move(partitioner_types),
@@ -187,11 +138,7 @@ name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, n
      &grouped_aggregator,
      false);
 
-   std::cout<<"finish grouped aggregator"<<std::endl;
- 
    auto outputs = partitioner.execute({input_batch});
-
-   std::cout<<"finish partitioner"<<std::endl;
 
    std::size_t partition_size = 10000000; // from sirius_physical_partition.hpp
 
@@ -208,3 +155,131 @@ name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, n
    
 
  }
+
+
+
+ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two partition keys",
+  "[physical_partition]",
+  int32_t,
+  int64_t,
+  float,
+  double,
+  int16_t,
+  bool,
+  decimal64_tag,
+  string_tag,
+  timestamp_us_tag,
+  date32_tag)
+{
+using Traits = gpu_type_traits<TestType>;
+
+auto memory_manager = initialize_memory_manager();
+auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+REQUIRE(space != nullptr);
+
+std::size_t num_values0 = 40;
+std::size_t num_values1 = 10;
+std::size_t prime_repeater = 17; // repeating all values this number of times
+std::size_t total_num_values = num_values0 * num_values1 * prime_repeater;
+
+std::vector<typename Traits::type> values0(total_num_values);
+std::vector<int32_t> values1(total_num_values);
+ std::size_t vidx0 = 0, vidx1 = 0;
+
+for (int i_prime = 0; i_prime < prime_repeater; ++i_prime) {
+
+  if constexpr (Traits::is_string) {
+    for (int i = 0; i < num_values0; ++i) {
+      for (int32_t j = 0; j < num_values1; ++j) {
+         values0[vidx0++] = std::to_string(i);
+         values1[vidx1++] = j;
+      }
+    }
+  } else if constexpr (std::is_same_v<typename Traits::type, int32_t> ||
+        std::is_same_v<typename Traits::type, int64_t> ||
+        std::is_same_v<typename Traits::type, int16_t> || 
+        std::is_same_v<typename Traits::type, float> ||
+          std::is_same_v<typename Traits::type, double>) {
+          for (int i = 0; i < num_values0; ++i) {
+            for (int32_t j = 0; j < num_values1; ++j) {
+               values0[vidx0++] = static_cast<typename Traits::type>(i);
+               values1[vidx1++] = j;
+            }
+          }
+  } else if constexpr (std::is_same_v<typename Traits::type, bool>) {
+    for (int i = 0; i < num_values0; ++i) {
+      for (int32_t j = 0; j < num_values1; ++j) {
+         values0[vidx0++] = (i % 2 == 0);
+         values1[vidx1++] = j;
+      }
+    }
+  }
+}
+std::shared_ptr<data_batch> input_batch0; // batch for the aggregation key0 and 1
+if constexpr (Traits::is_string) {
+  input_batch0 = make_string_batch(*space, values0);
+} else if constexpr (Traits::is_decimal) {
+  input_batch0 = make_decimal64_batch(*space, values0, Traits::scale);
+} else if constexpr (Traits::is_ts) {
+  input_batch0 = make_timestamp_batch(*space, values0, Traits::cudf_type);
+} else {
+  input_batch0 = make_numeric_batch<typename Traits::type>(*space, values0, Traits::cudf_type);
+}
+
+std::shared_ptr<data_batch> input_batch1 = make_numeric_batch<int32_t>(*space, values1, cudf::type_id::INT32);
+
+// we can make the third column which is for aggregation the same as the second column because the values wont matter
+std::shared_ptr<data_batch> input_batch2 = make_numeric_batch<int32_t>(*space, values1, cudf::type_id::INT32);
+auto input_batch = concatenate_batches_horizontal({input_batch0, input_batch1, input_batch2}, *space);
+
+// this cardinality is not real, we are setting here this large in order to force more partitions to be made
+std::size_t estimated_cardinality = 100000000; // 100 million rows = PARTITION_SIZE x 10
+
+// Create DuckDB context for aggregate function binding
+duckdb::DuckDB db(nullptr);
+duckdb::Connection con(db);
+auto& context = *con.context;
+
+// Create aggregate expressions: GROUP BY column 0, SUM(column 1)
+auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
+{0, 1},      // group_indexes: GROUP BY column 0 and 1
+{"min"},  // aggregations: MIN
+{2}       // agg_indexes: MIN(column 2)
+);
+
+// Create partitioner types (copy of agg_output_types before moving)
+duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+
+// Create the grouped aggregate merge operator
+sirius_physical_grouped_aggregate_merge grouped_aggregator(
+context,
+std::move(agg_result.output_types),
+std::move(agg_result.aggregates),
+std::move(agg_result.groups),
+estimated_cardinality);
+
+sirius_physical_partition partitioner(
+std::move(partitioner_types),
+estimated_cardinality,
+&grouped_aggregator,
+false);
+
+auto outputs = partitioner.execute({input_batch});
+
+std::size_t partition_size = 10000000; // from sirius_physical_partition.hpp
+
+std::size_t expected_num_partitions = (estimated_cardinality + partition_size - 1) / partition_size;
+
+REQUIRE(outputs.size() == expected_num_partitions);
+
+// count the number of rows in each output and make sure it's the same and the initial inputs
+std::size_t total_num_rows = 0;
+for (auto& output : outputs) {
+  std::size_t num_rows_out = output->get_data()->cast<gpu_table_representation>().get_table().num_rows();
+  REQUIRE(num_rows_out % prime_repeater == 0); // each group was created to have prime_repeater rows, so each partition should have a multiple of that
+  total_num_rows += num_rows_out;
+}
+REQUIRE(total_num_rows == total_num_values);
+
+
+}

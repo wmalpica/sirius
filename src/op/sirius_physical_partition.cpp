@@ -20,7 +20,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n.hpp"
@@ -74,7 +74,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
 } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type = PartitionType::HASH;
-    auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
+    auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
     _partition_keys = grouped_aggregate_op.group_idx;
 
     // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate operator which may be what we want to use when we care about grouping sets
@@ -117,6 +117,10 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
     // assert that we have only one input batch
     if (input_batches.size() != 1) {
       throw std::runtime_error("We expect only one input batch for partition operator");
+    }
+
+    if (_num_partitions < 2) {
+      return input_batches;
     }
 
     auto input_batch = input_batches[0];
