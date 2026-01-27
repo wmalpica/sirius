@@ -63,6 +63,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
+<<<<<<< HEAD
   //! The grouping sets
   duckdb::GroupedAggregateData grouped_aggregate_data;
 
@@ -86,6 +87,12 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
   std::vector<int> group_idx;
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
+=======
+// Grouped aggregatge definitions for cudf compute
+std::vector<int> group_idx;
+std::vector<cudf::aggregation::Kind> cudf_aggregates;
+std::vector<int> cudf_aggregate_idx;
+>>>>>>> 9ade2f5 (refactored and cleaned up agg operators)
 
 
   std::size_t current_partition_index = 0;

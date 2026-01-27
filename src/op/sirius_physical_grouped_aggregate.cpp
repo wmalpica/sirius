@@ -18,31 +18,32 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 
 namespace sirius {
 namespace op {
 
-static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
-{
-  duckdb::set<duckdb::idx_t> group_indices;
+// static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
+//   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
+// {
+//   duckdb::set<duckdb::idx_t> group_indices;
 
-  if (groups.empty()) { return {}; }
+//   if (groups.empty()) { return {}; }
 
-  for (auto& group : groups) {
-    D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
-    auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
-    group_indices.insert(bound_ref.index);
-  }
-  duckdb::idx_t highest_index = *group_indices.rbegin();
-  duckdb::vector<duckdb::LogicalType> types(highest_index + 1, duckdb::LogicalType::SQLNULL);
-  for (auto& group : groups) {
-    auto& bound_ref        = group->Cast<duckdb::BoundReferenceExpression>();
-    types[bound_ref.index] = bound_ref.return_type;
-  }
-  return types;
-}
+//   for (auto& group : groups) {
+//     D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
+//     auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
+//     group_indices.insert(bound_ref.index);
+//   }
+//   duckdb::idx_t highest_index = *group_indices.rbegin();
+//   duckdb::vector<duckdb::LogicalType> types(highest_index + 1, duckdb::LogicalType::SQLNULL);
+//   for (auto& group : groups) {
+//     auto& bound_ref        = group->Cast<duckdb::BoundReferenceExpression>();
+//     types[bound_ref.index] = bound_ref.return_type;
+//   }
+//   return types;
+// }
 
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::ClientContext& context,
@@ -93,126 +94,84 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
-  // get a list of all aggregates to be computed
-  const duckdb::idx_t group_count = groups_p.size();
-  if (grouping_sets.empty()) {
-    duckdb::GroupingSet set;
-    for (duckdb::idx_t i = 0; i < group_count; i++) {
-      set.insert(i);
-    }
-    grouping_sets.push_back(std::move(set));
-  }
-  input_group_types = create_group_chunk_types(groups_p);
 
-  grouped_aggregate_data.InitializeGroupby(
-    std::move(groups_p), std::move(expressions), std::move(grouping_functions_p));
+  // TODO: for now commenting out this code because we are not using grouping sets yet. Will add it back later when necessary.
 
-  auto& aggregates = grouped_aggregate_data.aggregates;
-  // filter_indexes must be pre-built, not lazily instantiated in parallel...
-  // Because everything that lives in this class should be read-only at execution time
-  idx_t aggregate_input_idx = 0;
-  for (idx_t i = 0; i < aggregates.size(); i++) {
-    auto& aggregate = aggregates[i];
-    auto& aggr      = aggregate->Cast<duckdb::BoundAggregateExpression>();
-    aggregate_input_idx += aggr.children.size();
-    if (aggr.aggr_type == duckdb::AggregateType::DISTINCT) {
-      distinct_filter.push_back(i);
-    } else if (aggr.aggr_type == duckdb::AggregateType::NON_DISTINCT) {
-      non_distinct_filter.push_back(i);
-    } else {  // LCOV_EXCL_START
-      throw duckdb::NotImplementedException(
-        "AggregateType not implemented in PhysicalHashAggregate");
-    }  // LCOV_EXCL_STOP
-  }
+  // // get a list of all aggregates to be computed
+  // const duckdb::idx_t group_count = groups_p.size();
+  // if (grouping_sets.empty()) {
+  //   duckdb::GroupingSet set;
+  //   for (duckdb::idx_t i = 0; i < group_count; i++) {
+  //     set.insert(i);
+  //   }
+  //   grouping_sets.push_back(std::move(set));
+  // }
+  // input_group_types = create_group_chunk_types(groups_p);
 
-  for (idx_t i = 0; i < aggregates.size(); i++) {
-    auto& aggregate = aggregates[i];
-    auto& aggr      = aggregate->Cast<duckdb::BoundAggregateExpression>();
-    if (aggr.filter) {
-      auto& bound_ref_expr = aggr.filter->Cast<duckdb::BoundReferenceExpression>();
-      if (!filter_indexes.count(aggr.filter.get())) {
-        // Replace the bound reference expression's index with the corresponding index of the
-        // payload chunk
-        // TODO: Still not quite sure why duckdb replace the index
-        filter_indexes[aggr.filter.get()] = bound_ref_expr.index;
-        bound_ref_expr.index              = aggregate_input_idx;
-      }
-      aggregate_input_idx++;
-    }
-  }
+  // grouped_aggregate_data.InitializeGroupby(
+  //   std::move(groups_p), std::move(expressions), std::move(grouping_functions_p));
 
-  distinct_collection_info =
-    duckdb::DistinctAggregateCollectionInfo::Create(grouped_aggregate_data.aggregates);
+  // auto& aggregates = grouped_aggregate_data.aggregates;
+  // // filter_indexes must be pre-built, not lazily instantiated in parallel...
+  // // Because everything that lives in this class should be read-only at execution time
+  // idx_t aggregate_input_idx = 0;
+  // for (idx_t i = 0; i < aggregates.size(); i++) {
+  //   auto& aggregate = aggregates[i];
+  //   auto& aggr      = aggregate->Cast<duckdb::BoundAggregateExpression>();
+  //   aggregate_input_idx += aggr.children.size();
+  //   if (aggr.aggr_type == duckdb::AggregateType::DISTINCT) {
+  //     distinct_filter.push_back(i);
+  //   } else if (aggr.aggr_type == duckdb::AggregateType::NON_DISTINCT) {
+  //     non_distinct_filter.push_back(i);
+  //   } else {  // LCOV_EXCL_START
+  //     throw duckdb::NotImplementedException(
+  //       "AggregateType not implemented in PhysicalHashAggregate");
+  //   }  // LCOV_EXCL_STOP
+  // }
 
-  for (idx_t i = 0; i < grouping_sets.size(); i++) {
-    groupings.emplace_back(grouping_sets[i],
-                           grouped_aggregate_data,
-                           distinct_collection_info,
-                           group_validity,
-                           distinct_validity);
-  }
+  // for (idx_t i = 0; i < aggregates.size(); i++) {
+  //   auto& aggregate = aggregates[i];
+  //   auto& aggr      = aggregate->Cast<duckdb::BoundAggregateExpression>();
+  //   if (aggr.filter) {
+  //     auto& bound_ref_expr = aggr.filter->Cast<duckdb::BoundReferenceExpression>();
+  //     if (!filter_indexes.count(aggr.filter.get())) {
+  //       // Replace the bound reference expression's index with the corresponding index of the
+  //       // payload chunk
+  //       // TODO: Still not quite sure why duckdb replace the index
+  //       filter_indexes[aggr.filter.get()] = bound_ref_expr.index;
+  //       bound_ref_expr.index              = aggregate_input_idx;
+  //     }
+  //     aggregate_input_idx++;
+  //   }
+  // }
 
-  // The output of groupby is ordered as the grouping columns first followed by the aggregate
-  // columns See RadixHTLocalSourceState::Scan for more details
-  idx_t total_output_columns = 0;
-  for (auto& aggregate : aggregates) {
-    auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
-    total_output_columns++;
-  }
-  total_output_columns += grouped_aggregate_data.GroupCount();
+  // distinct_collection_info =
+  //   duckdb::DistinctAggregateCollectionInfo::Create(grouped_aggregate_data.aggregates);
+
+  // for (idx_t i = 0; i < grouping_sets.size(); i++) {
+  //   groupings.emplace_back(grouping_sets[i],
+  //                          grouped_aggregate_data,
+  //                          distinct_collection_info,
+  //                          group_validity,
+  //                          distinct_validity);
+  // }
+
+  // // The output of groupby is ordered as the grouping columns first followed by the aggregate
+  // // columns See RadixHTLocalSourceState::Scan for more details
+  // idx_t total_output_columns = 0;
+  // for (auto& aggregate : aggregates) {
+  //   auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
+  //   total_output_columns++;
+  // }
+  // total_output_columns += grouped_aggregate_data.GroupCount();
 
 
+  auto cudf_defs = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
+  group_idx = std::move(cudf_defs.group_idx);
+  cudf_aggregates = std::move(cudf_defs.cudf_aggregates);
+  cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
 
-// Convert the grouped aggregate data to cudf compute definitions
-  {
-    // 1. Extract group_idx from grouped_aggregate_data.groups
-    for (const auto& group : grouped_aggregate_data.groups) {
-      D_ASSERT(group->type == duckdb::ExpressionType::BOUND_REF);
-      auto& bound_ref = group->Cast<duckdb::BoundReferenceExpression>();
-      group_idx.push_back(static_cast<int>(bound_ref.index));
-    }
 
-    // 2. Extract aggregates (cudf::aggregation::Kind) from grouped_aggregate_data.aggregates
-    for (const auto& aggregate : grouped_aggregate_data.aggregates) {
-      auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
-      
-      // Convert DuckDB aggregate function name to cudf::aggregation::Kind
-      cudf::aggregation::Kind agg_kind;
-      if (aggr.function.name == "sum" || aggr.function.name == "sum_no_overflow") {
-        agg_kind = cudf::aggregation::Kind::SUM;
-      } else if (aggr.function.name == "count") {
-        agg_kind = cudf::aggregation::Kind::COUNT_VALID;
-      } else if (aggr.function.name == "count_star") {
-        agg_kind = cudf::aggregation::Kind::COUNT_ALL;
-      } else if (aggr.function.name == "min") {
-        agg_kind = cudf::aggregation::Kind::MIN;
-      } else if (aggr.function.name == "max") {
-        agg_kind = cudf::aggregation::Kind::MAX;
-      } else {
-        throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name);
-      }
-      cudf_aggregates.push_back(agg_kind);
-      
-      // 3. Extract aggregate_idx from the children of the aggregate expression
-      if (aggr.children.empty()) {
-        // COUNT(*) has no children - use 0 as a placeholder (will be handled by COUNT_ALL)
-        if (aggr.function.name == "count_star") {
-          cudf_aggregate_idx.push_back(0);
-        } else {
-          throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with no children");
-        }
-      } else {
-        if (aggr.children.size() == 1) {
-          // Extract the column index from the first child (most aggregates have one child)
-          D_ASSERT(aggr.children[0]->type == duckdb::ExpressionType::BOUND_REF);
-          auto& bound_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
-          cudf_aggregate_idx.push_back(static_cast<int>(bound_ref.index));
-        } else {
-          throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with " + std::to_string(aggr.children.size()) + " children");
-        }
-      }
-    }
-  }
 }
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate::execute(

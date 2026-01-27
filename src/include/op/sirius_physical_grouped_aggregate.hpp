@@ -60,21 +60,21 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
-  //! The grouping sets
-  duckdb::GroupedAggregateData grouped_aggregate_data;
+  // //! The grouping sets
+  // duckdb::GroupedAggregateData grouped_aggregate_data;
 
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
-  //! The radix partitioned hash tables (one per grouping set)
-  duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
-  duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
-  //! A recreation of the input chunk, with nulls for everything that isn't a group
-  duckdb::vector<duckdb::LogicalType> input_group_types;
+  // //! The radix partitioned hash tables (one per grouping set)
+  // duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
+  // duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
+  // //! A recreation of the input chunk, with nulls for everything that isn't a group
+  // duckdb::vector<duckdb::LogicalType> input_group_types;
 
-  // Filters given to sink and friends
-  duckdb::unsafe_vector<duckdb::idx_t> non_distinct_filter;
-  duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
+  // // Filters given to sink and friends
+  // duckdb::unsafe_vector<duckdb::idx_t> non_distinct_filter;
+  // duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
 
-  duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
+  // duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
 
 // Grouped aggregatge definitions for cudf compute
 std::vector<int> group_idx;
