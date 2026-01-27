@@ -75,16 +75,19 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
-    for (duckdb::idx_t i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
-      auto& grouping = grouped_aggregate_op.groupings[i];
-      for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {
-        auto& group = grouped_aggregate_op.grouped_aggregate_data.groups[group_idx];
-        if (group->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-          _partition_keys.push_back(group->Cast<duckdb::BoundReferenceExpression>().index);
-        }
-      }
-    }
-  } else if (op->type == SiriusPhysicalOperatorType::ORDER_BY) {
+    _partition_keys = grouped_aggregate_op.group_idx;
+
+    // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate operator which may be what we want to use when we care about grouping sets
+    // for (duckdb::idx_t i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
+    //   auto& grouping = grouped_aggregate_op.groupings[i];
+    //   for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {
+    //     auto& group = grouped_aggregate_op.grouped_aggregate_data.groups[group_idx];
+    //     if (group->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    //       _partition_keys.push_back(group->Cast<duckdb::BoundReferenceExpression>().index);
+    //     }
+    //   }
+    // }
+  } else if (op->type == duckdb::PhysicalOperatorType::ORDER_BY) {
     _partition_type = PartitionType::RANGE;
     auto& order_by_op = op->Cast<sirius_physical_order>();
     for (size_t order_idx = 0; order_idx < order_by_op.orders.size(); order_idx++) {
@@ -123,11 +126,13 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
       case PartitionType::HASH:
       partitioned_results = gpu_partition_impl::hash_partition(input_batch, _partition_keys, _num_partitions, cudf::get_default_stream(),
       *input_batch->get_memory_space());
+      break;
       case PartitionType::RANGE:
         throw std::runtime_error("Range partitioning is not implemented yet");
       case PartitionType::EVENLY:
       partitioned_results = gpu_partition_impl::evenly_partition(input_batch, _num_partitions, cudf::get_default_stream(),
       *input_batch->get_memory_space());
+      break;
       case PartitionType::CUSTOM:
         throw std::runtime_error("Custom partitioning is not implemented yet");
       default:

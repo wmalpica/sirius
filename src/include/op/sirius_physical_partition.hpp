@@ -68,7 +68,7 @@ class sirius_physical_partition : public sirius_physical_partition_consumer_oper
   bool is_build_partition();
 
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
-  sirius_physical_operator* get_parent_op() const { return _parent_op; }
+  [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
