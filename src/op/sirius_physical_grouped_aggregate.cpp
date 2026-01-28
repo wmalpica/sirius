@@ -24,6 +24,8 @@
 namespace sirius {
 namespace op {
 
+
+// TODO: we may need some of these functions later when we implement grouping sets
 // static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
 //   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
 // {

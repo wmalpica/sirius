@@ -60,10 +60,13 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
-  // //! The grouping sets
+  duckdb::vector<duckdb::GroupingSet> grouping_sets;
+
+// TODO: we may need some of these variables later when we implement grouping sets
+
+    // //! The grouping sets
   // duckdb::GroupedAggregateData grouped_aggregate_data;
 
-  duckdb::vector<duckdb::GroupingSet> grouping_sets;
   // //! The radix partitioned hash tables (one per grouping set)
   // duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
   // duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
