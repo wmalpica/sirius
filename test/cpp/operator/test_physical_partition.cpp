@@ -115,7 +115,7 @@
    auto& context = *con.context;
 
    // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
-   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
+   auto agg_result = sirius::test::create_aggregate_expressions<gpu_type_traits<int32_t>>(
      {0},      // group_indexes: GROUP BY column 0
      {"sum"},  // aggregations: SUM
      {1}       // agg_indexes: SUM(column 1)
@@ -241,7 +241,7 @@ duckdb::Connection con(db);
 auto& context = *con.context;
 
 // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
-auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
+auto agg_result = sirius::test::create_aggregate_expressions<gpu_type_traits<int32_t>>(
 {0, 1},      // group_indexes: GROUP BY column 0 and 1
 {"min"},  // aggregations: MIN
 {2}       // agg_indexes: MIN(column 2)
@@ -280,6 +280,65 @@ for (auto& output : outputs) {
   total_num_rows += num_rows_out;
 }
 REQUIRE(total_num_rows == total_num_values);
+
+
+}
+
+
+
+TEST_CASE("sirius_physical_partition partitions data_batch with single partition key and 1 partition",
+  "[physical_partition]")
+{
+auto memory_manager = initialize_memory_manager();
+auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+REQUIRE(space != nullptr);
+
+std::size_t num_values = 10000;
+
+std::vector<int32_t> values(num_values);
+std::iota(values.begin(), values.end(), 0);
+std::shared_ptr<data_batch> input_batch0 = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+
+// create a batch for the aggregation value to just be a int32_t
+std::shared_ptr<data_batch> input_batch1 = make_numeric_batch<int32_t>(*space, std::vector<int32_t>(num_values, 1), cudf::type_id::INT32);
+
+// Concatenate the two batches horizontally (side by side columns)
+auto input_batch = concatenate_batches_horizontal({input_batch0, input_batch1}, *space);
+
+std::size_t estimated_cardinality = num_values; 
+
+// Create DuckDB context for aggregate function binding
+duckdb::DuckDB db(nullptr);
+duckdb::Connection con(db);
+auto& context = *con.context;
+
+// Create aggregate expressions: GROUP BY column 0, SUM(column 1)
+auto agg_result = sirius::test::create_aggregate_expressions<gpu_type_traits<int32_t>>(
+{0},      // group_indexes: GROUP BY column 0
+{"sum"},  // aggregations: SUM
+{1}       // agg_indexes: SUM(column 1)
+);
+
+// Create partitioner types (copy of agg_output_types before moving)
+duckdb::vector<duckdb::LogicalType> partitioner_types = agg_result.output_types;
+
+// Create the grouped aggregate merge operator
+sirius_physical_grouped_aggregate_merge grouped_aggregator(
+context,
+std::move(agg_result.output_types),
+std::move(agg_result.aggregates),
+std::move(agg_result.groups),
+estimated_cardinality);
+
+sirius_physical_partition partitioner(
+std::move(partitioner_types),
+estimated_cardinality,
+&grouped_aggregator,
+false);
+
+auto outputs = partitioner.execute({input_batch});
+REQUIRE(outputs.size() == 1);
+REQUIRE(outputs[0]->get_data()->cast<gpu_table_representation>().get_table().num_rows() == num_values);
 
 
 }

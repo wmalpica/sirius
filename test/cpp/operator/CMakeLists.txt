@@ -27,4 +27,5 @@ set(TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_ungrouped_aggregate.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_table_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_partition.cpp    
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_grouped_aggregate.cpp
     PARENT_SCOPE)
