@@ -16,7 +16,7 @@
 
  #include "operator_test_utils.hpp"
  #include "operator_type_traits.hpp"
- #include "utils/aggregate_test_utils.hpp"
+ #include "operator/aggregate/aggregate_test_utils.hpp"
  
  #include <catch.hpp>
  #include <op/sirius_physical_partition.hpp>
