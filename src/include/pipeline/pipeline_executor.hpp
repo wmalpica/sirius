@@ -155,7 +155,7 @@ class pipeline_executor {
    */
   std::future<void> start_query();
 
- private:
+ protected:
   void management_eventloop();
 
   void schedule_next_scan_tasks();
