@@ -212,7 +212,9 @@ sirius_physical_operator::get_next_port_after_sink()
 
 std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
-  if (ports.empty()) { return std::nullopt; }
+  if (ports.empty()) { 
+    throw std::runtime_error("In sirius_physical_operator::get_next_task_hint: no ports found for operator " + get_name());
+  } 
 
   // look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {

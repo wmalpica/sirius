@@ -18,6 +18,7 @@
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "gpu_context.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
@@ -96,6 +97,46 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
 };
 
 /**
+ * @brief A mock DuckDB scan operator for testing get_next_task_hint behavior.
+ *
+ * This mock allows controlling the exhausted state to test different scenarios
+ * in get_next_task_hint() which checks the exhausted flag.
+ */
+class mock_sirius_physical_duckdb_scan : public sirius_physical_duckdb_scan {
+ public:
+  mock_sirius_physical_duckdb_scan()
+    : sirius_physical_duckdb_scan(
+        {duckdb::LogicalType::BIGINT},                    // types - at least one type
+        duckdb::TableFunction(),                          // function
+        nullptr,                                          // bind_data
+        {duckdb::LogicalType::BIGINT},                    // returned_types
+        {duckdb::ColumnIndex(0)},                         // column_ids - at least one column
+        {0},                                              // projection_ids
+        {"col0"},                                         // names
+        nullptr,                                          // table_filters
+        0,                                                // estimated_cardinality
+        duckdb::ExtraOperatorInfo(),                      // extra_info
+        {},                                               // parameters
+        {})                                               // virtual_columns
+  {
+  }
+
+  /**
+   * @brief Set the exhausted state for testing.
+   *
+   * @param value true if the scan should be exhausted, false otherwise
+   */
+  void set_exhausted(bool value) { exhausted.store(value); }
+
+  /**
+   * @brief Get the current exhausted state.
+   *
+   * @return true if exhausted, false otherwise
+   */
+  bool is_exhausted() const { return exhausted.load(); }
+};
+
+/**
  * @brief A mock GPU pipeline for testing FULL barrier scenarios.
  *
  * This class allows controlling the return value of is_pipeline_finished()
@@ -108,6 +149,15 @@ class mock_gpu_pipeline : public sirius_pipeline {
   void set_finished(bool finished) { _finished = finished; }
 
   bool is_pipeline_finished() const override { return _finished; }
+
+  void add_operators(std::vector<std::shared_ptr<sirius_physical_operator>> ops) {
+    for (auto& op : ops) {
+      operators.push_back(*op);
+    }
+    if (!ops.empty()) {
+      sink = ops.back().get();
+    }
+  }
 
  private:
   bool _finished;
@@ -141,6 +191,33 @@ class mock_pipeline_builder {
     port->dest_pipeline = dest_pipeline;
     op.add_port(port_id, std::move(port));
   }
+};
+
+//===----------------------------------------------------------------------===//
+// Pipeline Setup Utility
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Utility structure to hold the result of create_connected_pipelines.
+ */
+struct connected_pipelines_result {
+  // The four pipelines
+  duckdb::shared_ptr<mock_gpu_pipeline> pipe_a;
+  duckdb::shared_ptr<mock_gpu_pipeline> pipe_b;
+  duckdb::shared_ptr<mock_gpu_pipeline> pipe_c;
+  duckdb::shared_ptr<mock_gpu_pipeline> pipe_d;
+
+  // The four operators (one per pipeline)
+  std::shared_ptr<mock_sirius_physical_duckdb_scan> op_a;
+  std::shared_ptr<mock_sirius_physical_operator> op_b;
+  std::shared_ptr<mock_sirius_physical_duckdb_scan> op_c;
+  std::shared_ptr<mock_sirius_physical_operator> op_d;
+
+  // Data repositories for each port (need to be kept alive)
+  std::unique_ptr<cucascade::shared_data_repository> repo_ab;
+  std::unique_ptr<cucascade::shared_data_repository> repo_bd;
+  std::unique_ptr<cucascade::shared_data_repository> repo_cd;
+ 
 };
 
 //===----------------------------------------------------------------------===//
@@ -270,6 +347,108 @@ class test_fixture {
   sirius::sirius_pipeline_hashmap pipeline_map;
 };
 
+
+/**
+ * @brief Create a connected pipeline structure for testing.
+ *
+ * Creates 4 pipelines with the following structure:
+ *   A -> B -> D
+ *        C -> D
+ *
+ * - pipe_b has port port_ab (from A)
+ * - pipe_d has two ports: port_bd (from B) and port_cd (from C)
+ * - Each pipeline has one operator
+ *
+ * @param fixture The test fixture (used to create mock pipelines)
+ * @param port_ab_barrier_type Barrier type for port_ab
+ * @param port_ab_num_batches Number of data batches in port_ab's repository
+ * @param port_bd_barrier_type Barrier type for port_bd
+ * @param port_bd_num_batches Number of data batches in port_bd's repository
+ * @param port_cd_barrier_type Barrier type for port_cd
+ * @param port_cd_num_batches Number of data batches in port_cd's repository
+ * @return connected_pipelines_result containing all created objects
+ */
+ inline connected_pipelines_result create_connected_pipelines(
+  test_fixture& fixture,
+  MemoryBarrierType port_ab_barrier_type,
+  size_t port_ab_num_batches,
+  MemoryBarrierType port_bd_barrier_type,
+  size_t port_bd_num_batches,
+  MemoryBarrierType port_cd_barrier_type,
+  size_t port_cd_num_batches)
+{
+  connected_pipelines_result result;
+
+  // Create the four operators
+  result.op_a = std::make_shared<mock_sirius_physical_duckdb_scan>();
+  result.op_a->set_exhausted(false);
+  result.op_b = std::make_shared<mock_sirius_physical_operator>();
+  result.op_c = std::make_shared<mock_sirius_physical_duckdb_scan>();
+  result.op_c->set_exhausted(false);
+  result.op_d = std::make_shared<mock_sirius_physical_operator>();
+
+
+  // Create the four pipelines
+  result.pipe_a = fixture.create_mock_pipeline();
+  result.pipe_a->add_operators({result.op_a});
+  result.pipe_b = fixture.create_mock_pipeline();
+  result.pipe_b->add_operators({result.op_b});
+  result.pipe_c = fixture.create_mock_pipeline();
+  result.pipe_c->add_operators({result.op_c});
+  result.pipe_d = fixture.create_mock_pipeline();
+  result.pipe_d->add_operators({result.op_d});
+
+  // Create data repositories for the three ports
+  result.repo_ab = std::make_unique<cucascade::shared_data_repository>();
+  result.repo_bd = std::make_unique<cucascade::shared_data_repository>();
+  result.repo_cd = std::make_unique<cucascade::shared_data_repository>();
+
+  // Populate repo_ab with the specified number of batches
+  for (size_t i = 0; i < port_ab_num_batches; ++i) {
+    auto batch = std::make_shared<cucascade::data_batch>(1, nullptr);
+    result.repo_ab->add_data_batch(batch);
+  }
+
+  // Populate repo_bd with the specified number of batches
+  for (size_t i = 0; i < port_bd_num_batches; ++i) {
+    auto batch = std::make_shared<cucascade::data_batch>(1, nullptr);
+    result.repo_bd->add_data_batch(batch);
+  }
+
+  // Populate repo_cd with the specified number of batches
+  for (size_t i = 0; i < port_cd_num_batches; ++i) {
+    auto batch = std::make_shared<cucascade::data_batch>(1, nullptr);
+    result.repo_cd->add_data_batch(batch);
+  }
+
+  // Set up port_ab on op_b (A -> B)
+  mock_pipeline_builder::setup_operator_with_pipeline_port(*result.op_b,
+                                                           "port_ab",
+                                                           port_ab_barrier_type,
+                                                           result.repo_ab.get(),
+                                                           result.pipe_a,
+                                                           result.pipe_b);
+
+  // Set up port_bd on op_d (B -> D)
+  mock_pipeline_builder::setup_operator_with_pipeline_port(*result.op_d,
+                                                           "port_bd",
+                                                           port_bd_barrier_type,
+                                                           result.repo_bd.get(),
+                                                           result.pipe_b,
+                                                           result.pipe_d);
+
+  // Set up port_cd on op_d (C -> D)
+  mock_pipeline_builder::setup_operator_with_pipeline_port(*result.op_d,
+                                                           "port_cd",
+                                                           port_cd_barrier_type,
+                                                           result.repo_cd.get(),
+                                                           result.pipe_c,
+                                                           result.pipe_d);
+
+  return result;
+}
+
+
 //===----------------------------------------------------------------------===//
 // task_creator Thread Pool Tests
 //===----------------------------------------------------------------------===//
@@ -371,25 +550,6 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
 // get_operator_for_next_task Tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_scans",
-          "[task_creator]")
-{
-  test_fixture fixture;
-
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
-
-  // Create a mock operator with no ports (will return monostate)
-  auto mock_op = std::make_unique<mock_sirius_physical_operator>();
-
-  // process_next_task should just return nullptr because there its not really connected to anything
-  // and has no data
-  auto next_op = creator.get_operator_for_next_task(mock_op.get());
-
-  // Nothing should be scheduled
-  REQUIRE(next_op == nullptr);
-}
-
 TEST_CASE("get_operator_for_next_task for operator with data returns the operator",
           "[task_creator]")
 {
@@ -426,7 +586,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   // Call process_next_task - this should attempt to schedule with hint_op
   // Note: This will try to access hint_op->get_port("default")->dest_pipeline
   // which we've set up above
-  auto next_op = creator.get_operator_for_next_task(hint_op.get());
+  auto next_op = creator.get_operator_for_next_task(source_op.get());
 
   REQUIRE(next_op == hint_op.get());
 
@@ -436,7 +596,71 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   // REQUIRE(scheduled_nodes.size() == 1);
   // REQUIRE(scheduled_nodes[0] == hint_op.get());
 }
-// WSM TODO continue to fix tests
+
+TEST_CASE("process_next_task with 4 pipeline graph all FULL barriers", "[task_creator]")
+{
+test_fixture fixture;
+
+// Create connected pipelines with specific configurations
+auto result = create_connected_pipelines(fixture,
+                                        MemoryBarrierType::FULL,
+                                        2,  // 2 batches in port_ab
+                                        MemoryBarrierType::FULL,
+                                        1,  // 1 batch in port_bd
+                                        MemoryBarrierType::FULL,
+                                        3);  // 3 batches in port_cd
+// none of the pipelines are finished. 
+// all operators next task should point at the scan operators A or C
+result.pipe_a->set_finished(false);
+result.pipe_b->set_finished(false);
+result.pipe_c->set_finished(false);
+result.pipe_d->set_finished(false);
+
+
+testable_task_creator creator(
+  2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+auto next_op = creator.get_operator_for_next_task(result.op_a.get());
+REQUIRE(next_op == result.op_a.get());
+next_op = creator.get_operator_for_next_task(result.op_b.get());
+REQUIRE(next_op == result.op_a.get());
+next_op = creator.get_operator_for_next_task(result.op_c.get());
+REQUIRE(next_op == result.op_c.get());
+next_op = creator.get_operator_for_next_task(result.op_d.get());
+REQUIRE(next_op == result.op_c.get());
+
+// now set the pipeline A to finished
+result.pipe_a->set_finished(true);
+result.op_a->set_exhausted(true);
+
+next_op = creator.get_operator_for_next_task(result.op_a.get());
+REQUIRE(next_op == nullptr);
+next_op = creator.get_operator_for_next_task(result.op_b.get());
+REQUIRE(next_op == result.op_b.get());
+next_op = creator.get_operator_for_next_task(result.op_c.get());
+REQUIRE(next_op == result.op_c.get());
+next_op = creator.get_operator_for_next_task(result.op_d.get());
+REQUIRE(next_op == result.op_c.get());
+
+// now set the pipeline C to finished
+result.pipe_c->set_finished(true);
+result.op_c->set_exhausted(true);
+
+next_op = creator.get_operator_for_next_task(result.op_a.get());
+REQUIRE(next_op == nullptr);
+next_op = creator.get_operator_for_next_task(result.op_b.get());
+REQUIRE(next_op == result.op_b.get());
+next_op = creator.get_operator_for_next_task(result.op_c.get());
+REQUIRE(next_op == nullptr);
+next_op = creator.get_operator_for_next_task(result.op_d.get());
+REQUIRE(next_op == result.op_b.get());
+
+// WSM TODO: pop data form op b and see
+
+}
+
+
+
 // TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[task_creator]")
 // {
 //   test_fixture fixture;
@@ -482,7 +706,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   REQUIRE(nodes.size() == 1);
 //   REQUIRE(nodes[0] == ready_op.get());
 // }
-
+// WSM TODO continue to fix tests
 // TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creator]")
 // {
 //   test_fixture fixture;
@@ -959,3 +1183,59 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
 //   REQUIRE(completed.load() == num_calls);
 // }
+
+//===----------------------------------------------------------------------===//
+// Connected Pipelines Utility Tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("create_connected_pipelines utility creates correct structure", "[task_creator][utility]")
+{
+  test_fixture fixture;
+
+  // Create connected pipelines with specific configurations
+  auto result = create_connected_pipelines(fixture,
+                                          MemoryBarrierType::PIPELINE,
+                                          2,  // 2 batches in port_ab
+                                          MemoryBarrierType::FULL,
+                                          1,  // 1 batch in port_bd
+                                          MemoryBarrierType::PARTIAL,
+                                          3);  // 3 batches in port_cd
+
+  // Verify we have 4 pipelines
+  REQUIRE(result.pipe_a != nullptr);
+  REQUIRE(result.pipe_b != nullptr);
+  REQUIRE(result.pipe_c != nullptr);
+  REQUIRE(result.pipe_d != nullptr);
+
+  // Verify we have 4 operators
+  REQUIRE(result.op_a != nullptr);
+  REQUIRE(result.op_b != nullptr);
+  REQUIRE(result.op_c != nullptr);
+  REQUIRE(result.op_d != nullptr);
+
+  // Verify op_b has one port (port_ab)
+  auto op_b_ports = result.op_b->get_port_ids();
+  REQUIRE(op_b_ports.size() == 1);
+  REQUIRE(std::string(op_b_ports[0]) == "port_ab");
+
+  // Verify op_d has two ports (port_bd and port_cd)
+  auto op_d_ports = result.op_d->get_port_ids();
+  REQUIRE(op_d_ports.size() == 2);
+  std::vector<std::string> port_names;
+  for (const auto& port_id : op_d_ports) {
+    port_names.push_back(std::string(port_id));
+  }
+  REQUIRE(std::find(port_names.begin(), port_names.end(), "port_bd") != port_names.end());
+  REQUIRE(std::find(port_names.begin(), port_names.end(), "port_cd") != port_names.end());
+
+  // Verify op_b's pipeline is pipe_b (through port dest_pipeline)
+  REQUIRE(result.op_b->get_pipeline() == result.pipe_b);
+
+  // Verify op_d's pipeline is pipe_d
+  REQUIRE(result.op_d->get_pipeline() == result.pipe_d);
+
+  // Verify data repositories have correct number of batches
+  REQUIRE(result.repo_ab->size() == 2);
+  REQUIRE(result.repo_bd->size() == 1);
+  REQUIRE(result.repo_cd->size() == 3);
+}

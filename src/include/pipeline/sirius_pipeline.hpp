@@ -145,7 +145,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void mark_task_created();
   void mark_task_completed();
 
- private:
+ protected:
   //! Whether or not the pipeline has been readied
   bool ready;
   //! Whether or not the pipeline has been initialized
