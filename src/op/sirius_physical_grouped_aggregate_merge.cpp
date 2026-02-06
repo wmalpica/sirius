@@ -173,14 +173,14 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
  
 std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
 {
-
+ printf("sirius_physical_grouped_aggregate_merge::get_next_task_input_batch num_partitions: %d\n", ports.begin()->second->repo->num_partitions());
   // we need to lock, then pull all the batches from one partition and return them, and increment the partition index
     std::lock_guard<std::mutex> lg(lock);
-    if (current_partition_index < ports[0]->repo->num_partitions()) {
+    if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
       std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
       bool found_batch = true;
       while (found_batch) {
-        auto batch = ports[0]->repo->pop_data_batch(::cucascade::batch_state::task_created, current_partition_index);
+        auto batch = ports.begin()->second->repo->pop_data_batch(::cucascade::batch_state::task_created, current_partition_index);
         if (batch) {
           input_batch.push_back(std::move(batch));
         } else {
@@ -188,8 +188,10 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
         }
       }
       current_partition_index++;
+      printf("sirius_physical_grouped_aggregate_merge::get_next_task_input_batch returning input_batch size: %d\n", input_batch.size());
       return input_batch; 
     } else {
+      printf("sirius_physical_grouped_aggregate_merge::get_next_task_input_batch returning nullopt\n");
       return std::nullopt;
     }
 }

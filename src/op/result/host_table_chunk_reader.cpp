@@ -193,32 +193,48 @@ host_table_chunk_reader::host_table_chunk_reader(
   duckdb::vector<duckdb::LogicalType> const& types_p)
   : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
 {
+  printf("[host_table_chunk_reader] host_table_chunk_reader constructor entry \n");
+  if (!host_table.get_host_table().get()) {
+    printf("[host_table_chunk_reader] get_host_table() is null (unique_ptr not set) \n");
+    throw std::runtime_error(
+      "[host_table_chunk_reader] get_host_table() is null (unique_ptr not set)");
+  }
+  if (!_allocation) {
+    printf("[host_table_chunk_reader] host_table allocation is null (cannot read column data) \n");
+    throw std::runtime_error(
+      "[host_table_chunk_reader] host_table allocation is null (cannot read column data)");
+  }
+  printf("[host_table_chunk_reader] host_table_chunk_reader constructor 2 \n");
   // Unpack metadata
   auto metadata_nodes = sirius::unpack_metadata_to_nodes(host_table.get_host_table()->metadata);
-
+  printf("[host_table_chunk_reader] host_table_chunk_reader constructor 3 \n");
   if (metadata_nodes.size() != _types.size()) {
     throw std::runtime_error(
       "[host_table_chunk_reader] Metadata column count does not match expected column count.");
   }
-
+  printf("[host_table_chunk_reader] host_table_chunk_reader constructor 4 \n");
   // Initialize column readers
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
+    printf("[host_table_chunk_reader] host_table_chunk_reader constructor 5 \n");
     if (col_idx == 0) {
       _total_rows = static_cast<size_t>(metadata_nodes[col_idx].size);
       if (_total_rows < 0) {
+        printf("[host_table_chunk_reader] Negative total rows in first column. \n");
         throw std::runtime_error("[host_table_chunk_reader] Negative total rows in first column.");
       }
     } else if (metadata_nodes[col_idx].size != _total_rows) {
+      printf("[host_table_chunk_reader] Metadata column size mismatch across columns. \n");
       throw std::runtime_error(
         "[host_table_chunk_reader] Metadata column size mismatch across columns.");
     }
 
     // For the time being, we do not handle HUGEINT, as cudf does not support it
     if (_types[col_idx] == duckdb::LogicalType::HUGEINT) {
-      throw std::runtime_error(
+      printf("[host_table_chunk_reader] HUGEINT type is not currently supported. \n");
+        throw std::runtime_error(
         "[host_table_chunk_reader] HUGEINT type is not currently supported.");
     }
-
+    printf("[host_table_chunk_reader] host_table_chunk_reader constructor 6 \n");
     _column_readers.emplace_back(metadata_nodes[col_idx], _allocation);
   }
 }

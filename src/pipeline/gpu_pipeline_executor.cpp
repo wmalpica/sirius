@@ -109,7 +109,23 @@ void gpu_pipeline_executor::manager_loop()
                             consumers = std::move(output_consumers),
                             pipeline]() mutable {
       try {
+        printf("gpu_pipeline_executor starting task, operators:");
+        if (pipeline) {
+          auto ops = pipeline->get_operators();
+          for (size_t i = 0; i < ops.size(); ++i) {
+            printf(" %s%s", ops[i].get().get_name().c_str(), i + 1 < ops.size() ? "," : "");
+          }
+        }
+        printf("\n");
         task->execute();
+        printf("gpu_pipeline_executor finished task, operators:");
+        if (pipeline) {
+          auto ops = pipeline->get_operators();
+          for (size_t i = 0; i < ops.size(); ++i) {
+            printf(" %s%s", ops[i].get().get_name().c_str(), i + 1 < ops.size() ? "," : "");
+          }
+        }
+        printf("\n");
       } catch (...) {
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         return;

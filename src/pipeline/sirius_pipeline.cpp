@@ -17,6 +17,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include "duckdb/common/algorithm.hpp"
+#include <cstdio>
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/tree_renderer/text_tree_renderer.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
@@ -160,6 +161,17 @@ duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline:
   return operators;
 }
 
+duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> sirius_pipeline::get_operators()
+  const
+{
+  duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
+  result.reserve(operators.size());
+  for (const auto& ref : operators) {
+    result.push_back(ref.get());
+  }
+  return result;
+}
+
 std::vector<sirius_pipeline*> sirius_pipeline::get_parents()
 {
   std::vector<sirius_pipeline*> result;
@@ -278,6 +290,13 @@ void sirius_pipeline::update_pipeline_status()
     if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
                                  // get_next_task_hint() to check if the source is ready?
       pipeline_finished.store(true);
+      printf("sirius_pipeline set to finished (source exhausted), operators:");
+      if (source) { printf(" %s", source.get()->get_name().c_str()); }
+      for (size_t i = 0; i < operators.size(); ++i) {
+        printf(" %s", operators[i].get().get_name().c_str());
+      }
+      if (sink) { printf(" %s", sink.get()->get_name().c_str()); }
+      printf("\n");
       return;
     }
   } else {
@@ -290,7 +309,16 @@ void sirius_pipeline::update_pipeline_status()
     // Lets fix this by putting task creation as a method in the pipeline class so that it can be
     // done atomically.
     if (first_node->is_source_pipeline_finished() && first_node->all_ports_empty()) {
-      pipeline_finished = tasks_created.load() == tasks_completed.load();
+      if (tasks_created.load() == tasks_completed.load()) {
+        pipeline_finished = true;
+        printf("sirius_pipeline set to finished (tasks_created==tasks_completed), operators:");
+        if (source) { printf(" %s", source.get()->get_name().c_str()); }
+        for (size_t i = 0; i < operators.size(); ++i) {
+          printf(" %s", operators[i].get().get_name().c_str());
+        }
+        if (sink) { printf(" %s", sink.get()->get_name().c_str()); }
+        printf("\n");
+      }
     }
   }
 }

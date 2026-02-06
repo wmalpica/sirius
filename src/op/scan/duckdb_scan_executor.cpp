@@ -203,9 +203,13 @@ void duckdb_scan_executor::manager_loop()
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
       try {
+        printf("duckdb_scan_executor starting scan task (pipeline_id=%zu, operator: DUCKDB_SCAN)\n",
+               static_cast<size_t>(scan_task->get_pipeline_id()));
         auto consumers = scan_task->get_output_consumers();
         auto batches   = get_scan_output(scan_task);
         scan_task->publish_output(std::move(batches));
+        printf("duckdb_scan_executor finished scan task (pipeline_id=%zu, operator: DUCKDB_SCAN)\n",
+               static_cast<size_t>(scan_task->get_pipeline_id()));
         t.reset();
         if (_task_creator) {
           for (auto* consumer : consumers) {

@@ -144,9 +144,12 @@ void task_creator::manager_loop()
         try {
           auto node = request->node;
           if (node == nullptr) { return; }
+          printf("task_creator request node: %s\n", node->get_name().c_str());
 
           node = get_operator_for_next_task(node);
           if (node == nullptr) { return; }
+          printf("task_creator task node (from get_operator_for_next_task): %s\n",
+                 node->get_name().c_str());
 
           // Get what we need to create the task
           auto pipeline = node->get_pipeline();
@@ -188,6 +191,8 @@ void task_creator::manager_loop()
                                                  // repositories
               std::move(scan_task_local_state),
               _scan_operator_global_state_map[operator_id]);
+            printf("task_creator created task type: duckdb_scan_task (operator: %s)\n",
+                   node->get_name().c_str());
             pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
                                             // with the task creation
             _pipeline_executor->schedule(std::move(scan_task));
@@ -220,6 +225,8 @@ void task_creator::manager_loop()
                 destination_data_repositories,
                 std::move(local_state),
                 _gpu_operator_global_state_map[operator_id]);
+              printf("task_creator created task type: gpu_pipeline_task (operator: %s)\n",
+                     node->get_name().c_str());
               _pipeline_executor->schedule(std::move(task));
             }
           }

@@ -37,9 +37,10 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  // _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  _num_partitions = (estimated_cardinality + 1000 - 1) / 1000;
   _parent_op      = parent_op;
-  printf("sirius_physical_partition constructor parent_op: %s\n", _parent_op->get_name().c_str());
+  printf("sirius_physical_partition constructor num_partitions: %d parent_op: %s\n", _num_partitions, _parent_op->get_name().c_str());
   _is_build       = is_build;
   get_partition_keys_and_type(parent_op, is_build);
 }
