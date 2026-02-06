@@ -23,6 +23,7 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "cudf/types.hpp"
@@ -31,12 +32,14 @@
 namespace sirius {
 namespace op {
 
-class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator {
+class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
+// WSM TODO: do we need all these constructors?
+
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
   sirius_physical_grouped_aggregate_merge(duckdb::vector<duckdb::LogicalType> types,

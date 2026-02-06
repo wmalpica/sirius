@@ -50,7 +50,7 @@ namespace op {
     return "UNKNOWN";
   }
 
-class sirius_physical_partition : public sirius_physical_partition_consumer_operator {
+class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
 

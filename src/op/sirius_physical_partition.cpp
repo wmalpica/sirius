@@ -34,11 +34,12 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
                                                      duckdb::idx_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build)
-  : sirius_physical_partition_consumer_operator(
+  : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
+  printf("sirius_physical_partition constructor parent_op: %s\n", _parent_op->get_name().c_str());
   _is_build       = is_build;
   get_partition_keys_and_type(parent_op, is_build);
 }
@@ -74,7 +75,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
 } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type = PartitionType::HASH;
-    auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
+    auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
     _partition_keys = grouped_aggregate_op.group_idx;
 
     // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate operator which may be what we want to use when we care about grouping sets
@@ -87,6 +88,11 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     //     }
     //   }
     // }
+  } else if (op->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
+    _partition_type = PartitionType::HASH;
+    auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
+    _partition_keys = grouped_aggregate_merge_op.group_idx;
+
   } else if (op->type == SiriusPhysicalOperatorType::ORDER_BY) {
     _partition_type = PartitionType::RANGE;
     auto& order_by_op = op->Cast<sirius_physical_order>();
@@ -133,10 +139,12 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
       break;
       case PartitionType::RANGE:
         throw std::runtime_error("Range partitioning is not implemented yet");
-      case PartitionType::EVENLY:
-      partitioned_results = gpu_partition_impl::evenly_partition(input_batch, _num_partitions, cudf::get_default_stream(),
-      *input_batch->get_memory_space());
-      break;
+      case PartitionType::EVENLY: 
+      {
+          partitioned_results = gpu_partition_impl::evenly_partition(input_batch, _num_partitions, cudf::get_default_stream(),
+            *input_batch->get_memory_space());
+            break;
+      }
       case PartitionType::CUSTOM:
         throw std::runtime_error("Custom partitioning is not implemented yet");
       default:

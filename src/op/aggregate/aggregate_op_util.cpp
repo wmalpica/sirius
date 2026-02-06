@@ -20,8 +20,25 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
+#include <cstdio>
 #include <stdexcept>
 #include <string>
+
+namespace {
+
+const char* cudf_aggregation_kind_str(cudf::aggregation::Kind k)
+{
+  switch (k) {
+    case cudf::aggregation::Kind::SUM: return "SUM";
+    case cudf::aggregation::Kind::COUNT_VALID: return "COUNT_VALID";
+    case cudf::aggregation::Kind::COUNT_ALL: return "COUNT_ALL";
+    case cudf::aggregation::Kind::MIN: return "MIN";
+    case cudf::aggregation::Kind::MAX: return "MAX";
+    default: return "?";
+  }
+}
+
+}  // namespace
 
 namespace sirius {
 namespace op {
@@ -79,6 +96,24 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
     }
   }
+
+  // Describe the result for debugging
+  printf("convert_duckdb_aggregates_to_cudf result:\n");
+  printf("  group_idx (%zu): [", result.group_idx.size());
+  for (size_t i = 0; i < result.group_idx.size(); ++i) {
+    printf("%s%d", i ? ", " : "", result.group_idx[i]);
+  }
+  printf("]\n");
+  printf("  cudf_aggregates (%zu): [", result.cudf_aggregates.size());
+  for (size_t i = 0; i < result.cudf_aggregates.size(); ++i) {
+    printf("%s%s", i ? ", " : "", cudf_aggregation_kind_str(result.cudf_aggregates[i]));
+  }
+  printf("]\n");
+  printf("  cudf_aggregate_idx (%zu): [", result.cudf_aggregate_idx.size());
+  for (size_t i = 0; i < result.cudf_aggregate_idx.size(); ++i) {
+    printf("%s%d", i ? ", " : "", result.cudf_aggregate_idx[i]);
+  }
+  printf("]\n");
 
   return result;
 }
