@@ -56,7 +56,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates data_ba
 {
   using Traits = gpu_type_traits<TestType>;
 
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
@@ -118,7 +118,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates data_ba
 {
 using Traits = gpu_type_traits<TestType>;
 
-auto memory_manager = initialize_memory_manager();
+auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
 auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
 REQUIRE(space != nullptr);
 

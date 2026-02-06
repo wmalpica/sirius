@@ -128,7 +128,8 @@ inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
   auto concatenated_table = std::make_unique<cudf::table>(std::move(all_columns));
   
   // Create and return new data_batch
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(*concatenated_table, space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(concatenated_table), space);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }

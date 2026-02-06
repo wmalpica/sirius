@@ -54,7 +54,7 @@
  {
    using Traits = gpu_type_traits<TestType>;
  
-   auto memory_manager = initialize_memory_manager();
+   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
    auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
    REQUIRE(space != nullptr);
 
@@ -173,7 +173,7 @@
 {
 using Traits = gpu_type_traits<TestType>;
 
-auto memory_manager = initialize_memory_manager();
+auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
 auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
 REQUIRE(space != nullptr);
 
@@ -289,7 +289,7 @@ REQUIRE(total_num_rows == total_num_values);
 TEST_CASE("sirius_physical_partition partitions data_batch with single partition key and 1 partition",
   "[physical_partition]")
 {
-auto memory_manager = initialize_memory_manager();
+auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
 auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
 REQUIRE(space != nullptr);
 

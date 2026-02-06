@@ -24,7 +24,6 @@
 namespace sirius {
 namespace op {
 
-<<<<<<< HEAD
 static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
 {
@@ -77,19 +76,30 @@ static duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> convert_grouping_fun
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   sirius_physical_grouped_aggregate* grouped_aggregate)
   : sirius_physical_grouped_aggregate_merge(
-      grouped_aggregate->types,  // copied by value
-      copy_expressions(grouped_aggregate->grouped_aggregate_data.aggregates),
-      copy_expressions(grouped_aggregate->grouped_aggregate_data.groups),
-      grouped_aggregate->grouping_sets,  // copied by value
-      convert_grouping_functions(grouped_aggregate->grouped_aggregate_data.GetGroupingFunctions()),
-      grouped_aggregate->estimated_cardinality,
-      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,  // default
-      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)  // default
+    grouped_aggregate->types,  // copied by value
+    grouped_aggregate->group_idx,
+    grouped_aggregate->cudf_aggregates,
+    grouped_aggregate->cudf_aggregate_idx,
+    grouped_aggregate->estimated_cardinality)
 {
   child_op = grouped_aggregate;
-=======
->>>>>>> 9ade2f5 (refactored and cleaned up agg operators)
+}
+
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
+  duckdb::vector<duckdb::LogicalType> types,
+  std::vector<int> group_idx,
+  std::vector<cudf::aggregation::Kind> cudf_aggregates,
+  std::vector<int> cudf_aggregate_idx,
+  duckdb::idx_t estimated_cardinality)
+  : sirius_physical_operator(
+    SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
+    group_idx(std::move(group_idx)),
+    cudf_aggregates(std::move(cudf_aggregates)),
+    cudf_aggregate_idx(std::move(cudf_aggregate_idx))
+{
+}
+
+  sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::ClientContext& context,
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
@@ -135,7 +145,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   duckdb::TupleDataValidityType group_validity,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
-<<<<<<< HEAD
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
@@ -154,10 +163,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   // }
 
   // input_group_types = create_group_chunk_types(groups_p);
-=======
-      duckdb::PhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality)
-{
->>>>>>> 9ade2f5 (refactored and cleaned up agg operators)
 
   // Convert input parameters to cudf compute definitions BEFORE moving them
   auto cudf_defs = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
@@ -166,14 +171,13 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
 }
  
-std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate_merge::get_input_batch()
+std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
 {
 
   // we need to lock, then pull all the batches from one partition and return them, and increment the partition index
-  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-  
     std::lock_guard<std::mutex> lg(lock);
     if (current_partition_index < ports[0]->repo->num_partitions()) {
+      std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
       bool found_batch = true;
       while (found_batch) {
         auto batch = ports[0]->repo->pop_data_batch(::cucascade::batch_state::task_created, current_partition_index);
@@ -186,7 +190,7 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_
       current_partition_index++;
       return input_batch; 
     } else {
-      return std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
+      return std::nullopt;
     }
 }
 

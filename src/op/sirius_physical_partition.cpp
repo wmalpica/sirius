@@ -87,7 +87,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     //     }
     //   }
     // }
-  } else if (op->type == duckdb::PhysicalOperatorType::ORDER_BY) {
+  } else if (op->type == SiriusPhysicalOperatorType::ORDER_BY) {
     _partition_type = PartitionType::RANGE;
     auto& order_by_op = op->Cast<sirius_physical_order>();
     for (size_t order_idx = 0; order_idx < order_by_op.orders.size(); order_idx++) {
@@ -160,19 +160,6 @@ void sirius_physical_partition::sink(const std::vector<std::shared_ptr<::cucasca
       }
     }
     partition_id++;
-  }
-
-  if (!creator) {
-    throw std::runtime_error(
-      "sirius_physical_operator creator is null in sink_execute for operator " + get_name());
-  }
-  if (next_port_after_sink.size() > 0) {
-    auto current_pipeline =
-      next_port_after_sink[0].first->get_port(next_port_after_sink[0].second)->src_pipeline;
-    current_pipeline->update_pipeline_status();
-  }
-  for (auto& [next_op, port_id] : next_port_after_sink) {
-    if (next_op) { creator->process_next_task(next_op); }
   }
 }
 

@@ -39,6 +39,12 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
  public:
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
+  sirius_physical_grouped_aggregate_merge(duckdb::vector<duckdb::LogicalType> types,
+    std::vector<int> group_idx,
+    std::vector<cudf::aggregation::Kind> cudf_aggregates,
+    std::vector<int> cudf_aggregate_idx,
+    duckdb::idx_t estimated_cardinality);
+  
   sirius_physical_grouped_aggregate_merge(
     duckdb::ClientContext& context,
     duckdb::vector<duckdb::LogicalType> types,
@@ -63,7 +69,6 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
-<<<<<<< HEAD
   //! The grouping sets
   duckdb::GroupedAggregateData grouped_aggregate_data;
 
@@ -87,12 +92,6 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
   std::vector<int> group_idx;
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
-=======
-// Grouped aggregatge definitions for cudf compute
-std::vector<int> group_idx;
-std::vector<cudf::aggregation::Kind> cudf_aggregates;
-std::vector<int> cudf_aggregate_idx;
->>>>>>> 9ade2f5 (refactored and cleaned up agg operators)
 
 
   std::size_t current_partition_index = 0;
@@ -111,7 +110,7 @@ std::vector<int> cudf_aggregate_idx;
 
   bool sink_order_dependent() const override { return false; }
 
-  std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch() override;
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch() override;
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
