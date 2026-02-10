@@ -15,12 +15,19 @@
  */
 
 #include "op/sirius_physical_hash_join.hpp"
+#include "data/data_batch_utils.hpp"
 
 #include "duckdb/common/enums/physical_operator_type.hpp"
+#include <cstdio>
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+
+#include "cudf/copying.hpp"
+#include "cudf/join/join.hpp"
+#include "cudf/types.hpp"
+#include "cudf/table/table_view.hpp"
 
 namespace sirius {
 namespace op {
@@ -71,12 +78,14 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::vector<duckdb::LogicalType> delim_types,
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
-  : sirius_physical_operator(
+  : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond)),
     delim_types(std::move(delim_types))
 {
+  
+
   reorder_join_conditions(conditions);
 
   filter_pushdown = std::move(pushdown_info_p);
@@ -96,11 +105,12 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   auto& lhs_input_types = children[0]->get_types();
 
-  lhs_output_columns.col_idxs = left_projection_map;
+  lhs_output_columns.col_idxs =
+    std::vector<cudf::size_type>(left_projection_map.begin(), left_projection_map.end());
   if (lhs_output_columns.col_idxs.empty()) {
     lhs_output_columns.col_idxs.reserve(lhs_input_types.size());
     for (duckdb::idx_t i = 0; i < lhs_input_types.size(); i++) {
-      lhs_output_columns.col_idxs.emplace_back(i);
+      lhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
     }
   }
 
@@ -120,29 +130,85 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   auto& rhs_input_types = children[1]->get_types();
 
-  auto right_projection_map_copy = right_projection_map;
-  if (right_projection_map_copy.empty()) {
-    right_projection_map_copy.reserve(rhs_input_types.size());
+  std::vector<cudf::size_type> right_projection_cudf(right_projection_map.begin(),
+                                                    right_projection_map.end());
+  if (right_projection_cudf.empty()) {
+    right_projection_cudf.reserve(rhs_input_types.size());
     for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
-      right_projection_map_copy.emplace_back(i);
+      right_projection_cudf.emplace_back(static_cast<cudf::size_type>(i));
     }
   }
 
-  for (auto& rhs_col : right_projection_map_copy) {
+  for (auto rhs_col : right_projection_cudf) {
     auto& rhs_col_type = rhs_input_types[rhs_col];
 
-    auto it = build_columns_in_conditions.find(rhs_col);
+    auto it = build_columns_in_conditions.find(static_cast<duckdb::idx_t>(rhs_col));
     if (it == build_columns_in_conditions.end()) {
       payload_columns.col_idxs.push_back(rhs_col);
       payload_columns.col_types.push_back(rhs_col_type);
-      rhs_output_columns.col_idxs.push_back(condition_types.size() +
-                                            payload_columns.col_types.size() - 1);
+      rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(
+        condition_types.size() + payload_columns.col_types.size() - 1));
     } else {
-      rhs_output_columns.col_idxs.push_back(it->second);
+      rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(it->second));
     }
     rhs_output_columns.col_types.push_back(rhs_col_type);
   }
 
+
+  for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+    auto& condition = conditions[cond_idx];
+    if ((condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+        condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+        condition.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
+        condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {          
+      left_key_col_indices.push_back(condition.left->Cast<duckdb::BoundReferenceExpression>().index);
+      right_key_col_indices.push_back(condition.right->Cast<duckdb::BoundReferenceExpression>().index);
+    } else {
+      is_equality_join = false;
+    }
+  }
+
+  printf("sirius_physical_hash_join::sirius_physical_hash_join\n");
+  printf("  class: sirius_physical_hash_join\n");
+  printf("  left: %s\n", left ? left->get_name().c_str() : "(null)");
+  printf("  right: %s\n", right ? right->get_name().c_str() : "(null)");
+  printf("  join_type: %d\n", static_cast<int>(join_type));
+  printf("  conditions.size(): %zu\n", conditions.size());
+  printf("  delim_types.size(): %zu\n", this->delim_types.size());
+  printf("  estimated_cardinality: %llu\n", static_cast<unsigned long long>(estimated_cardinality));
+  printf("  pushdown_info: %s\n", pushdown_info_p ? "non-null" : "null");
+  printf("  is_equality_join: %s\n", is_equality_join ? "true" : "false");
+  printf("  left_key_col_indices: [");
+  for (size_t i = 0; i < left_key_col_indices.size(); i++) {
+    printf("%s%zu", i ? ", " : "", static_cast<size_t>(left_key_col_indices[i]));
+  }
+  printf("] (size=%zu)\n", left_key_col_indices.size());
+  printf("  right_key_col_indices: [");
+  for (size_t i = 0; i < right_key_col_indices.size(); i++) {
+    printf("%s%zu", i ? ", " : "", static_cast<size_t>(right_key_col_indices[i]));
+  }
+  printf("] (size=%zu)\n", right_key_col_indices.size());
+  printf("  payload_columns: col_idxs=[");
+  for (size_t i = 0; i < payload_columns.col_idxs.size(); i++) {
+    printf("%s%zu", i ? ", " : "", static_cast<size_t>(payload_columns.col_idxs[i]));
+  }
+  printf("] (size=%zu), col_types.size()=%zu\n",
+         payload_columns.col_idxs.size(),
+         payload_columns.col_types.size());
+  printf("  lhs_output_columns: col_idxs=[");
+  for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+    printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
+  }
+  printf("] (size=%zu), col_types.size()=%zu\n",
+         lhs_output_columns.col_idxs.size(),
+         lhs_output_columns.col_types.size());
+  printf("  rhs_output_columns: col_idxs=[");
+  for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+    printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
+  }
+  printf("] (size=%zu), col_types.size()=%zu\n",
+         rhs_output_columns.col_idxs.size(),
+         rhs_output_columns.col_types.size());
   // hash_table_result =
   // duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size() +
   //                                                              payload_columns.col_idxs.size());
@@ -213,6 +279,148 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
+}
+
+std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_physical_hash_join::get_next_task_input_batch()
+{
+  size_t batch_index = 0;
+  {
+    std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
+    if (left_batch_ids.empty() && right_batch_ids.empty()) {
+      left_batch_ids.reserve(ports["left"]->repo->num_partitions());
+      right_batch_ids.reserve(ports["right"]->repo->num_partitions());
+      for (size_t i = 0; i < ports["left"]->repo->num_partitions(); i++) {
+        left_batch_ids.push_back(ports["left"]->repo->get_batch_ids(i));
+        num_batches_to_process += left_batch_ids[i].size();
+      }
+      for (size_t i = 0; i < ports["right"]->repo->num_partitions(); i++) {
+        right_batch_ids.push_back(ports["right"]->repo->get_batch_ids(i));
+        num_batches_to_process += right_batch_ids[i].size();
+      }
+    }
+    if (current_partition_index < num_batches_to_process) {
+      batch_index = current_partition_index;
+      current_partition_index++;
+    } else {
+      return std::nullopt;
+    }
+  }
+  std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
+  input_batch.reserve(2);
+  size_t counter = 0;
+  for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
+    for (auto& batch_id : left_batch_ids[partition_idx]) {
+      if (counter == batch_index) {        
+        input_batch.push_back(ports["left"]->repo->get_data_batch_by_id(batch_id, cucascade::batch_state::task_created, partition_idx));
+        break;
+      }
+      counter++;
+    }
+  }
+  counter = 0;
+  for (size_t partition_idx = 0; partition_idx < right_batch_ids.size(); partition_idx++) {
+    for (auto& batch_id : right_batch_ids[partition_idx]) {
+      if (counter == batch_index) {        
+        input_batch.push_back(ports["right"]->repo->get_data_batch_by_id(batch_id, cucascade::batch_state::task_created, partition_idx));
+        break;
+      }
+      counter++;
+    }
+  }
+  return input_batch;
+}
+
+std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join::execute(
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  if (input_batches.size() != 2) {
+    throw std::runtime_error("Expected 2 input batches for hash join, got " + std::to_string(input_batches.size()));
+  }
+  if (!is_equality_join) {
+    throw std::runtime_error("Unsupported non-equality join of type type: " + duckdb::JoinTypeToString(join_type));
+  }
+  if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::RIGHT 
+      || join_type == duckdb::JoinType::OUTER || join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI){
+
+    cudf::table_view left_keys = get_cudf_table_view(*input_batches[0]).select(left_key_col_indices);
+    cudf::table_view right_keys = get_cudf_table_view(*input_batches[1]).select(right_key_col_indices);
+    // std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
+    //       std::unique_ptr<rmm::device_uvector<size_type>>> join_result;
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
+    bool collect_left = true;
+    bool collect_right = true;
+    if (join_type == duckdb::JoinType::INNER) {
+      auto join_result = cudf::inner_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
+      left_indices = std::move(join_result.first);
+      right_indices = std::move(join_result.second);
+    } else if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SEMI) {
+      auto join_result = cudf::left_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
+      left_indices = std::move(join_result.first);
+      right_indices = std::move(join_result.second);
+    } else if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI) {
+      auto join_result = cudf::left_join(right_keys, left_keys, cudf::null_equality::UNEQUAL, stream);
+      right_indices = std::move(join_result.first);
+      left_indices = std::move(join_result.second);
+    } else if (join_type == duckdb::JoinType::OUTER) {
+      auto join_result = cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
+      left_indices = std::move(join_result.first);
+      right_indices = std::move(join_result.second);
+    }
+    if (join_type == duckdb::JoinType::SEMI) {
+      collect_right = false;
+    } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+      collect_left = false;
+    }
+      
+    std::vector<std::unique_ptr<cudf::column>> out_cols;
+    if (collect_left) {
+      cudf::table_view left_cols_to_gather = get_cudf_table_view(*input_batches[0]).select(lhs_output_columns.col_idxs);
+      cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
+                                    left_indices->size(),
+                                    left_indices->data(),
+                                    nullptr,
+                                    0,
+                                    0,
+                                    {});
+      auto left_result = cudf::gather(left_cols_to_gather, left_map_view, cudf::out_of_bounds_policy::DONT_CHECK, stream);
+      out_cols = left_result->release();
+    }
+    if (collect_right) {
+      cudf::table_view right_cols_to_gather = get_cudf_table_view(*input_batches[1]).select(rhs_output_columns.col_idxs);
+      cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
+                                      right_indices->size(),
+                                      right_indices->data(),
+                                      nullptr,
+                                      0,
+                                      0,
+                                      {});
+      auto right_result = cudf::gather(right_cols_to_gather, right_map_view, cudf::out_of_bounds_policy::DONT_CHECK, stream);
+      auto right_out_cols = right_result->release();
+      for (auto& col : right_out_cols) {
+        out_cols.push_back(std::move(col));
+      }
+    }
+    
+    auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+    return std::vector<std::shared_ptr<cucascade::data_batch>>{
+        make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())};
+    
+  
+  // } else if (join_type == duckdb::JoinType::ANTI) {
+  //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
+  // } else if (join_type == duckdb::JoinType::MARK) {
+  //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
+  // } else if (join_type == duckdb::JoinType::SINGLE) {
+  //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
+  // } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+  //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
+  // } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
+  //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
+  } else {
+    throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
+  }
+
 }
 
 }  // namespace op

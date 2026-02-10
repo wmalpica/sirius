@@ -21,6 +21,7 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_order.hpp"
@@ -52,9 +53,20 @@ bool sirius_physical_partition::is_sink() const { return true; }
 void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_operator* op,
                                                             bool is_build)
 {
+  printf("sirius_physical_partition::get_partition_keys_and_type\n");
+  printf("  class: sirius_physical_partition\n");
+  printf("  op: %s\n", op->get_name().c_str());
+  printf("  is_build: %d\n", is_build);
   _partition_keys.clear();
   _partition_type = PartitionType::NONE;
+  if (op->type == SiriusPhysicalOperatorType::CONCAT) {
+    auto& concat_op = op->Cast<sirius_physical_concat>();
+    op = concat_op.get_parent_op();
+  }
+
+  
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    printf("sirius_physical_partition::get_partition_keys_and_type: HASH_JOIN\n");
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     if (is_build) {
