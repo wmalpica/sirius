@@ -261,6 +261,110 @@ TEST_CASE("gpu_execution - limit with filter", "[integration][gpu_execution][lim
                      "select n_nationkey, n_regionkey from nation where n_regionkey = 1 limit 3;");
 }
 
+
+//===----------------------------------------------------------------------===//
+// Join tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("gpu_execution - basic inner join", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n left join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join making nulls", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n left join region r on n.n_nationkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n right join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join making nulls", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n right join region r on n.n_nationkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic full outer join", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n full outer join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic full outer join making nulls", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n full outer join region r on n.n_nationkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic left semi join", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey from nation n semi join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic left semi join 2", "[integration][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey from nation n semi join region r on n.n_nationkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic right semi join", "[integration_disabled][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select r.r_regionkey from region r semi join nation n on r.r_regionkey = n.n_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic right semi join 2", "[integration_disabled][gpu_execution][join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select r.r_regionkey from region r semi join nation n on r.r_regionkey = n.n_nationkey;");
+}
+
 //===----------------------------------------------------------------------===//
 // Disabled tests - known issues
 //===----------------------------------------------------------------------===//

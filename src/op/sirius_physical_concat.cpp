@@ -43,20 +43,22 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
   if (parent_op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(parent_op);
     if (hash_join->join_type == duckdb::JoinType::LEFT ||
-        hash_join->join_type == duckdb::JoinType::ANTI) {
+        hash_join->join_type == duckdb::JoinType::ANTI ||
+        hash_join->join_type == duckdb::JoinType::SEMI ) {
       // if the join type is left or anti, then we need to concat all the batches into one batch for
       // the build side
       _concat_all = is_build;
     } else if (hash_join->join_type == duckdb::JoinType::RIGHT ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_ANTI) {
+               hash_join->join_type == duckdb::JoinType::RIGHT_ANTI ||
+               hash_join->join_type == duckdb::JoinType::RIGHT_SEMI) {
       // if the join type is right or right anti, then we need to concat all the batches into one
       // batch for the probe side
       _concat_all = !is_build;
     } else if (hash_join->join_type == duckdb::JoinType::INNER ||
-               hash_join->join_type == duckdb::JoinType::SEMI ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_SEMI ||
                hash_join->join_type == duckdb::JoinType::MARK) {
       _concat_all = false;
+    } else if( hash_join->join_type == duckdb::JoinType::OUTER) {
+      _concat_all = true;
     } else {
       throw std::runtime_error("sirius_physical_concat: unsupported join type");
     }
