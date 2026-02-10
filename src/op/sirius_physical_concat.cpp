@@ -36,7 +36,6 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
   _is_build       = is_build;
   // check if parent_op is a hash join
@@ -97,7 +96,7 @@ sirius_physical_concat::get_next_task_input_batch()
           // this mean that there is a batch that is bigger than the threshold, then we just output
           // that batch right away
           auto popped_batch =
-            port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created, i);
+            port_ptr->repo->pop_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
           input_batch.push_back(std::move(popped_batch));
         }
         break;
@@ -105,11 +104,14 @@ sirius_physical_concat::get_next_task_input_batch()
         // if the batch size does not exceed the threshold, then we need to add the batch to the
         // input batch
         auto popped_batch =
-          port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created, i);
+          port_ptr->repo->pop_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
         input_batch.push_back(std::move(popped_batch));
       }
     }
-    if (input_batch.size() != 0) { return std::move(input_batch); }
+    if (input_batch.size() != 0) { 
+      
+      printf("sirius_physical_concat::get_next_task_input_batch input_batch.size(): %zu\n", input_batch.size());
+      return std::move(input_batch); }
   }
   return std::nullopt;
 }
@@ -118,6 +120,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_concat::exec
   const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
+  printf("sirius_physical_concat::execute 0\n");
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {

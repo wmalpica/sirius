@@ -365,6 +365,16 @@ TEST_CASE("gpu_execution - basic right semi join 2", "[integration_disabled][gpu
                      "select r.r_regionkey from region r semi join nation n on r.r_regionkey = n.n_nationkey;");
 }
 
+TEST_CASE("gpu_execution - bigger inner join", "[integration][gpu_execution][bigger_join]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, o.o_custkey from lineitem l join orders o on l.l_orderkey = o.o_orderkey order by l.l_orderkey, l.l_linenumber limit 100;");
+}
+
+
 //===----------------------------------------------------------------------===//
 // Disabled tests - known issues
 //===----------------------------------------------------------------------===//

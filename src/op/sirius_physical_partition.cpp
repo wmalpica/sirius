@@ -38,7 +38,8 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  // _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  _num_partitions = 3;
   _parent_op      = parent_op;
   _is_build       = is_build;
   get_partition_keys_and_type(parent_op, is_build);
@@ -133,6 +134,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
+  printf("sirius_physical_partition::execute 0\n");
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator");
   }

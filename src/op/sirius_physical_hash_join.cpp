@@ -293,11 +293,11 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
 {
   printf("sirius_physical_hash_join::get_next_task_input_batch 0\n");
   // print all the port names
-  printf("  ports: ");
-  for (auto& [port_name, port_ptr] : ports) {
-    printf("%s ", port_name.c_str());
-  }
-  printf("\n");
+  // printf("  ports: ");
+  // for (auto& [port_name, port_ptr] : ports) {
+  //   printf("%s ", port_name.c_str());
+  // }
+  // printf("\n");
   size_t batch_index = 0;
   {
     std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
@@ -308,11 +308,25 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
 
       left_batch_ids.reserve(ports["default"]->repo->num_partitions());
       right_batch_ids.reserve(ports["build"]->repo->num_partitions());
+      printf("ports[\"default\"]->repo->num_partitions(): %zu\n", ports["default"]->repo->num_partitions());
       for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
         left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
         right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
         num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+        printf("partition %zu: left_batch_ids.size(): %zu, right_batch_ids.size(): %zu\n", i, left_batch_ids[i].size(), right_batch_ids[i].size());
+        // the contents of left_batch_ids and right_batch_ids are the batch ids, print the contents of left_batch_ids and right_batch_ids
+        printf("left_batch_ids[%zu]: ", i);
+        for (auto& batch_id : left_batch_ids[i]) {
+          printf("%zu ", batch_id);
+        }
+        printf("\n");
+        printf("right_batch_ids[%zu]: ", i);
+        for (auto& batch_id : right_batch_ids[i]) {
+          printf("%zu ", batch_id);
+        }
+        printf("\n");
       }
+      printf("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ  num_batches_to_process: %zu\n", num_batches_to_process);
     }
     if (current_partition_index < num_batches_to_process) {
       batch_index = current_partition_index;
@@ -321,25 +335,31 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
       return std::nullopt;
     }
   }
-  printf("sirius_physical_hash_join::get_next_task_input_batch 1\n");
+  printf("sirius_physical_hash_join::get_next_task_input_batch batch_index: %zu\n", batch_index);
 
+  // WSM TODO: refactor getting input batch into another function. That will solve the bug. 
   std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
   size_t counter = 0;
   for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
     size_t left_counter = 0;
     for (auto& left_batch_id : left_batch_ids[partition_idx]) {
+      printf("starting loop for left_batch_id: %zu\n", left_batch_id);
       size_t right_counter = 0;
       for (auto& right_batch_id : right_batch_ids[partition_idx]) {
         if (counter == batch_index) {  
           if (right_counter == right_batch_ids[partition_idx].size() - 1) {
+            printf("popping left batch %zu\n", left_batch_id);
             input_batch.push_back(ports["default"]->repo->pop_data_batch_by_id(left_batch_id, cucascade::batch_state::task_created, partition_idx));  
           } else {
+            printf("getting left batch %zu\n", left_batch_id);
             input_batch.push_back(ports["default"]->repo->get_data_batch_by_id(left_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
           if (left_counter == left_batch_ids[partition_idx].size() - 1) {
+            printf("popping right batch %zu\n", right_batch_id);
             input_batch.push_back(ports["build"]->repo->pop_data_batch_by_id(right_batch_id, cucascade::batch_state::task_created, partition_idx));
           } else {
+            printf("getting right batch %zu\n", right_batch_id);
             input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(right_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
           break;
@@ -347,9 +367,23 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
         right_counter++;
         counter++;
       }
+      if (counter == batch_index) {
+        break;
+      }
       left_counter++;
+      printf("left_counter: %zu\n", left_counter);
+    }
+    printf("counter: %zu\n", counter);
+    if (counter == batch_index) {
+      break;
     }
   }  
+  if (input_batch.size() == 0) {
+    printf("input_batch.size() == 0\n");
+    return std::nullopt;
+  } else if (input_batch.size() != 2) {
+    throw std::runtime_error("Expected 2 input batches for hash join, got " + std::to_string(input_batch.size()));
+  }
   printf("sirius_physical_hash_join::get_next_task_input_batch 2\n");
   printf("left side size: %zu\n", input_batch[0]->get_data()->get_size_in_bytes());
   printf("right side size: %zu\n", input_batch[1]->get_data()->get_size_in_bytes());
@@ -360,8 +394,8 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
-  printf("sirius_physical_hash_join::execute 0\n");
-  printf("  input_batches.size(): %zu\n", input_batches.size());
+  // printf("sirius_physical_hash_join::execute 0\n");
+  // printf("  input_batches.size(): %zu\n", input_batches.size());
 
   if (input_batches.size() != 2) {
     throw std::runtime_error("Expected 2 input batches for hash join, got " + std::to_string(input_batches.size()));
@@ -374,8 +408,8 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
 
     cudf::table_view left_keys = get_cudf_table_view(*input_batches[0]).select(left_key_col_indices);
     cudf::table_view right_keys = get_cudf_table_view(*input_batches[1]).select(right_key_col_indices);
-    printf("left keys size: %zu\n", left_keys.num_rows());
-    printf("right keys size: %zu\n", right_keys.num_rows());
+    // printf("left keys size: %zu\n", left_keys.num_rows());
+    // printf("right keys size: %zu\n", right_keys.num_rows());
     // std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
     //       std::unique_ptr<rmm::device_uvector<size_type>>> join_result;
     std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
@@ -415,13 +449,13 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
       
     std::vector<std::unique_ptr<cudf::column>> out_cols;
     if (collect_left) {
-      printf("collect left\n");
-      // print lhs_output_columns.col_idxs
-      printf("  lhs_output_columns.col_idxs: [");
-      for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
-        printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
-      }
-      printf("] (size=%zu)\n", lhs_output_columns.col_idxs.size());
+      // printf("collect left\n");
+      // // print lhs_output_columns.col_idxs
+      // printf("  lhs_output_columns.col_idxs: [");
+      // for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+      //   printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
+      // }
+      // printf("] (size=%zu)\n", lhs_output_columns.col_idxs.size());
       cudf::table_view left_cols_to_gather = get_cudf_table_view(*input_batches[0]).select(lhs_output_columns.col_idxs);
       cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
                                     left_indices->size(),
@@ -430,19 +464,19 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
                                     0,
                                     0,
                                     {});
-      printf("before left gather\n");
+      // printf("before left gather\n");
       auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_out_of_bounds_policy, stream);
-      printf("after left gather\n");
+      // printf("after left gather\n");
       out_cols = left_result->release();
     }
     if (collect_right) {
-      printf("collect right\n");
-      // print rhs_output_columns.col_idxs
-      printf("  rhs_output_columns.col_idxs: [");
-      for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
-        printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
-      }
-      printf("] (size=%zu)\n", rhs_output_columns.col_idxs.size());
+      // printf("collect right\n");
+      // // print rhs_output_columns.col_idxs
+      // printf("  rhs_output_columns.col_idxs: [");
+      // for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+      //   printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
+      // }
+      // printf("] (size=%zu)\n", rhs_output_columns.col_idxs.size());
       cudf::table_view right_cols_to_gather = get_cudf_table_view(*input_batches[1]).select(rhs_output_columns.col_idxs);
       cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
                                       right_indices->size(),
@@ -451,9 +485,9 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
                                       0,
                                       0,
                                       {});
-      printf("before right gather\n");
+      // printf("before right gather\n");
       auto right_result = cudf::gather(right_cols_to_gather, right_map_view, right_out_of_bounds_policy, stream);
-      printf("after right gather\n");
+      // printf("after right gather\n");
       auto right_out_cols = right_result->release();
       for (auto& col : right_out_cols) {
         out_cols.push_back(std::move(col));
@@ -461,7 +495,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
     }
     
     auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-    printf("output cudf table size: %zu\n", output_cudf_table->num_rows());
+    // printf("output cudf table size: %zu\n", output_cudf_table->num_rows());
     return std::vector<std::shared_ptr<cucascade::data_batch>>{
         make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())};
     
