@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "print.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
@@ -144,9 +145,10 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
     throw std::runtime_error("We expect only one input batch for partition operator");
   }
 
-  if (_num_partitions < 2) { return input_batches; }
+  printf("sirius_physical_partition::execute INPUT:\n");
+  sirius::print_data_batch_contents(*input_batches[0]);
 
-  
+  if (_num_partitions < 2) { return input_batches; }
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
@@ -167,6 +169,13 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
+
+  printf("sirius_physical_partition::execute OUTPUT (%zu partitions):\n", partitioned_results.size());
+  for (size_t i = 0; i < partitioned_results.size(); ++i) {
+    printf("--- partition %zu ---\n", i);
+    sirius::print_data_batch_contents(*partitioned_results[i]);
+  }
+
   return partitioned_results;
 }
 
