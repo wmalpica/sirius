@@ -109,8 +109,6 @@ sirius_physical_concat::get_next_task_input_batch()
       }
     }
     if (input_batch.size() != 0) { 
-      
-      printf("sirius_physical_concat::get_next_task_input_batch input_batch.size(): %zu\n", input_batch.size());
       return std::move(input_batch); }
   }
   return std::nullopt;
@@ -120,7 +118,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_concat::exec
   const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
-  printf("sirius_physical_concat::execute 0\n");
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {

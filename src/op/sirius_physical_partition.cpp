@@ -39,8 +39,7 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
-  // _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
-  _num_partitions = 3;
+  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
   _is_build       = is_build;
   get_partition_keys_and_type(parent_op, is_build);
@@ -55,18 +54,6 @@ bool sirius_physical_partition::is_sink() const { return true; }
 void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_operator* op,
                                                             bool is_build)
 {
-  printf("sirius_physical_partition::get_partition_keys_and_type\n");
-  printf("  class: sirius_physical_partition\n");
-  printf("  op: %s\n", op->get_name().c_str());
-  printf("  is_build: %d\n", is_build);
-  _partition_keys.clear();
-  _partition_type = PartitionType::NONE;
-  if (op->type == SiriusPhysicalOperatorType::CONCAT) {
-    auto& concat_op = op->Cast<sirius_physical_concat>();
-    op = concat_op.get_parent_op();
-  }
-
-  
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
@@ -86,12 +73,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
-    // print partition keys
-    printf("partition keys: ");
-    for (auto& key : _partition_keys) {
-      printf("%d ", key);
-    }
-    printf("\n");    
+   
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -140,15 +122,8 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
-  printf("sirius_physical_partition::execute 0\n");
-  if (input_batches.size() != 1) {
-    throw std::runtime_error("We expect only one input batch for partition operator");
-  }
-
-  printf("sirius_physical_partition::execute INPUT:\n");
-  sirius::print_data_batch_contents(*input_batches[0]);
-
-  if (_num_partitions < 2) { return input_batches; }
+  if (_num_partitions < 2) { 
+    return input_batches; }
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
@@ -168,12 +143,6 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
     default:
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
-  }
-
-  printf("sirius_physical_partition::execute OUTPUT (%zu partitions):\n", partitioned_results.size());
-  for (size_t i = 0; i < partitioned_results.size(); ++i) {
-    printf("--- partition %zu ---\n", i);
-    sirius::print_data_batch_contents(*partitioned_results[i]);
   }
 
   return partitioned_results;
