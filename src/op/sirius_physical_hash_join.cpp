@@ -289,6 +289,11 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
+
+
+
+
+
 std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_physical_hash_join::get_next_task_input_batch()
 {
   printf("sirius_physical_hash_join::get_next_task_input_batch 0\n");
@@ -337,7 +342,6 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
   }
   printf("sirius_physical_hash_join::get_next_task_input_batch batch_index: %zu\n", batch_index);
 
-  // WSM TODO: refactor getting input batch into another function. That will solve the bug. 
   std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
   size_t counter = 0;
@@ -362,32 +366,25 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
             printf("getting right batch %zu\n", right_batch_id);
             input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(right_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
-          break;
+          printf("returning left_counter: %zu, right_counter: %zu\n", left_counter, right_counter);
+          printf("input_batch[0]->get_data()->get_size_in_bytes(): %zu\n", input_batch[0]->get_data()->get_size_in_bytes());
+          printf("input_batch[1]->get_data()->get_size_in_bytes(): %zu\n", input_batch[1]->get_data()->get_size_in_bytes());
+          return input_batch;
         }
         right_counter++;
         counter++;
-      }
-      if (counter == batch_index) {
-        break;
-      }
+      }      
       left_counter++;
       printf("left_counter: %zu\n", left_counter);
     }
-    printf("counter: %zu\n", counter);
-    if (counter == batch_index) {
-      break;
-    }
+    printf("counter: %zu\n", counter);    
   }  
   if (input_batch.size() == 0) {
     printf("input_batch.size() == 0\n");
     return std::nullopt;
-  } else if (input_batch.size() != 2) {
-    throw std::runtime_error("Expected 2 input batches for hash join, got " + std::to_string(input_batch.size()));
-  }
-  printf("sirius_physical_hash_join::get_next_task_input_batch 2\n");
-  printf("left side size: %zu\n", input_batch[0]->get_data()->get_size_in_bytes());
-  printf("right side size: %zu\n", input_batch[1]->get_data()->get_size_in_bytes());
-  return input_batch;
+  } else {
+    throw std::runtime_error("Expected to have returned already or received nothing, but got " + std::to_string(input_batch.size()) + " input batches for hash join");
+  }  
 }
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join::execute(

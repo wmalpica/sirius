@@ -67,7 +67,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 
   
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-    printf("sirius_physical_partition::get_partition_keys_and_type: HASH_JOIN\n");
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     if (is_build) {
@@ -86,6 +85,12 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
+    // print partition keys
+    printf("partition keys: ");
+    for (auto& key : _partition_keys) {
+      printf("%d ", key);
+    }
+    printf("\n");    
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -140,6 +145,8 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
   }
 
   if (_num_partitions < 2) { return input_batches; }
+
+  
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
