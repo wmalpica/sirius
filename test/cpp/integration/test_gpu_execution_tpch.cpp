@@ -384,7 +384,7 @@ TEST_CASE("gpu_execution - basic left join 3", "[integration][gpu_execution][joi
     "select n.n_name, c.c_custkey, c.c_name  from nation n left join customer c on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - basic left join 0 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - basic left join 0 making nulls", "[integration][gpu_execution][join]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
@@ -465,7 +465,7 @@ TEST_CASE("gpu_execution - basic right join 0 making nulls", "[integration][gpu_
     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from nation n right join customer c on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - basic right join 1 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - basic right join 1 making nulls", "[integration][gpu_execution][join]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
@@ -564,7 +564,7 @@ TEST_CASE("gpu_execution - swapped left join 3", "[integration][gpu_execution][j
     "select n.n_name, c.c_custkey, c.c_name  from customer c left join nation n on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - swapped left join 0 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - swapped left join 0 making nulls", "[integration][gpu_execution][join]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
@@ -636,7 +636,7 @@ TEST_CASE("gpu_execution - swapped right join 3", "[integration][gpu_execution][
     "select n.n_name, c.c_custkey, c.c_name  from customer c right join nation n on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - swapped right join 0 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - swapped right join 0 making nulls", "[integration][gpu_execution][join]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
@@ -645,7 +645,7 @@ TEST_CASE("gpu_execution - swapped right join 0 making nulls", "[integration][gp
     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from customer c right join nation n on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - swapped right join 1 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - swapped right join 1 making nulls", "[integration][gpu_execution][join]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
@@ -654,7 +654,7 @@ TEST_CASE("gpu_execution - swapped right join 1 making nulls", "[integration][gp
     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from customer c right join nation n on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - swapped right join 2 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - swapped right join 2 making nulls", "[integration][gpu_execution][join]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
@@ -663,7 +663,7 @@ TEST_CASE("gpu_execution - swapped right join 2 making nulls", "[integration][gp
     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from customer c right join nation n on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - swapped right join 3 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - swapped right join 3 making nulls", "[integration][gpu_execution][join]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());

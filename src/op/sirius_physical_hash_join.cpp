@@ -19,6 +19,7 @@
 
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include <cstdio>
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -28,6 +29,7 @@
 #include "cudf/join/join.hpp"
 #include "cudf/types.hpp"
 #include "cudf/table/table_view.hpp"
+#include "cudf/unary.hpp"
 
 namespace sirius {
 namespace op {
@@ -93,15 +95,15 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   children.push_back(std::move(left));
   children.push_back(std::move(right));
 
-  duckdb::unordered_map<duckdb::idx_t, duckdb::idx_t> build_columns_in_conditions;
-  for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-    auto& condition = conditions[cond_idx];
-    condition_types.push_back(condition.left->return_type);
-    if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      build_columns_in_conditions.emplace(
-        condition.right->Cast<duckdb::BoundReferenceExpression>().index, cond_idx);
-    }
-  }
+  // duckdb::unordered_map<duckdb::idx_t, duckdb::idx_t> build_columns_in_conditions;
+  // for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+  //   auto& condition = conditions[cond_idx];
+  //   condition_types.push_back(condition.left->return_type);
+  //   if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+  //     build_columns_in_conditions.emplace(
+  //       condition.right->Cast<duckdb::BoundReferenceExpression>().index, cond_idx);
+  //   }
+  // }
 
   auto& lhs_input_types = children[0]->get_types();
 
@@ -138,42 +140,102 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   auto& rhs_input_types = children[1]->get_types();
 
-  std::vector<cudf::size_type> right_projection_cudf(right_projection_map.begin(),
-                                                    right_projection_map.end());
-  if (right_projection_cudf.empty()) {
-    right_projection_cudf.reserve(rhs_input_types.size());
+  // std::vector<cudf::size_type> right_projection_cudf(right_projection_map.begin(),
+  //                                                   right_projection_map.end());
+  // if (right_projection_cudf.empty()) {
+  //   right_projection_cudf.reserve(rhs_input_types.size());
+  //   for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
+  //     right_projection_cudf.emplace_back(static_cast<cudf::size_type>(i));
+  //   }
+  // }
+
+  // for (auto rhs_col : right_projection_cudf) {
+  //   auto& rhs_col_type = rhs_input_types[rhs_col];
+
+  //   auto it = build_columns_in_conditions.find(static_cast<duckdb::idx_t>(rhs_col));
+  //   if (it == build_columns_in_conditions.end()) {
+  //     payload_columns.col_idxs.push_back(rhs_col);
+  //     payload_columns.col_types.push_back(rhs_col_type);
+  //     rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(
+  //       condition_types.size() + payload_columns.col_types.size() - 1));
+  //   } else {
+  //     rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(it->second));
+  //   }
+  //   rhs_output_columns.col_types.push_back(rhs_col_type);
+  // }
+
+  if (right_projection_map.empty()) {
+    rhs_output_columns.col_idxs.reserve(rhs_input_types.size());
     for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
-      right_projection_cudf.emplace_back(static_cast<cudf::size_type>(i));
+      rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
+    }
+  } else {
+    rhs_output_columns.col_idxs.reserve(right_projection_map.size());
+    for (auto& col_idx : right_projection_map) {
+      if (col_idx < rhs_input_types.size()) {
+        rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(col_idx));
+      } else {
+        printf("WARNING:In sirius_physical_hash_join: right_projection_map index out of range");
+      }
     }
   }
 
-  for (auto rhs_col : right_projection_cudf) {
+  for (auto& rhs_col : rhs_output_columns.col_idxs) {
     auto& rhs_col_type = rhs_input_types[rhs_col];
-
-    auto it = build_columns_in_conditions.find(static_cast<duckdb::idx_t>(rhs_col));
-    if (it == build_columns_in_conditions.end()) {
-      payload_columns.col_idxs.push_back(rhs_col);
-      payload_columns.col_types.push_back(rhs_col_type);
-      rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(
-        condition_types.size() + payload_columns.col_types.size() - 1));
-    } else {
-      rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(it->second));
-    }
     rhs_output_columns.col_types.push_back(rhs_col_type);
   }
 
 
   for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition = conditions[cond_idx];
-    if ((condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
-        condition.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF &&
-        condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {          
-      left_key_col_indices.push_back(condition.left->Cast<duckdb::BoundReferenceExpression>().index);
-      right_key_col_indices.push_back(condition.right->Cast<duckdb::BoundReferenceExpression>().index);
-    } else {
+    if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+        condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      printf("Unsupported non-equality condition comparison: %d\n", static_cast<int>(condition.comparison));
+      printf("    left: %s\n", condition.left->ToString().c_str());
+      printf("    right: %s\n", condition.right->ToString().c_str());
       is_equality_join = false;
+      break;
     }
+
+    // Extract left key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
+    key_cast_info cast_info;
+    auto left_class = condition.left->GetExpressionClass();
+    auto right_class = condition.right->GetExpressionClass();
+
+    if (left_class == duckdb::ExpressionClass::BOUND_REF) {
+      left_key_col_indices.push_back(condition.left->Cast<duckdb::BoundReferenceExpression>().index);
+    } else if (left_class == duckdb::ExpressionClass::BOUND_CAST) {
+      auto& bound_cast = condition.left->Cast<duckdb::BoundCastExpression>();
+      if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        throw std::runtime_error("Unsupported join condition: BOUND_CAST child is not BOUND_REF (left)");
+      }
+      left_key_col_indices.push_back(bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
+      cast_info.cast_left = true;
+      cast_info.left_target_type = duckdb::GetCudfType(condition.left->return_type);
+      cast_necessary = true;
+    } else {
+      printf("Unsupported left expression class: %s\n", condition.left->ToString().c_str());
+      throw std::runtime_error("Unsupported join condition left expression");
+    }
+
+    // Extract right key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
+    if (right_class == duckdb::ExpressionClass::BOUND_REF) {
+      right_key_col_indices.push_back(condition.right->Cast<duckdb::BoundReferenceExpression>().index);
+    } else if (right_class == duckdb::ExpressionClass::BOUND_CAST) {
+      auto& bound_cast = condition.right->Cast<duckdb::BoundCastExpression>();
+      if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        throw std::runtime_error("Unsupported join condition: BOUND_CAST child is not BOUND_REF (right)");
+      }
+      right_key_col_indices.push_back(bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
+      cast_info.cast_right = true;
+      cast_info.right_target_type = duckdb::GetCudfType(condition.right->return_type);
+      cast_necessary = true;
+    } else {
+      printf("Unsupported right expression class: %s\n", condition.right->ToString().c_str());
+      throw std::runtime_error("Unsupported join condition right expression");
+    }
+
+    key_casts.push_back(cast_info);
   }
 
   printf("sirius_physical_hash_join::sirius_physical_hash_join\n");
@@ -186,6 +248,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   printf("  estimated_cardinality: %llu\n", static_cast<unsigned long long>(estimated_cardinality));
   printf("  pushdown_info: %s\n", pushdown_info_p ? "non-null" : "null");
   printf("  is_equality_join: %s\n", is_equality_join ? "true" : "false");
+  printf("  cast_necessary: %s\n", cast_necessary ? "true" : "false");
   printf("  left_key_col_indices: [");
   for (size_t i = 0; i < left_key_col_indices.size(); i++) {
     printf("%s%zu", i ? ", " : "", static_cast<size_t>(left_key_col_indices[i]));
@@ -387,6 +450,80 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
   }  
 }
 
+/// Result of prepare_join_keys: the key table views and any cast columns that must remain alive.
+struct join_keys_result {
+  // Owned cast columns - kept alive so the table views referencing them remain valid
+  std::vector<std::unique_ptr<cudf::column>> owned_cast_columns;
+  cudf::table_view left_keys;
+  cudf::table_view right_keys;
+  // Storage for column views used to build the table_views (must outlive the table_views)
+  std::vector<cudf::column_view> left_key_views;
+  std::vector<cudf::column_view> right_key_views;
+};
+
+/// Build the left and right key table views for the join.
+/// If cast_necessary is false, this simply selects the key columns from the input batches.
+/// If cast_necessary is true, each key column that requires a cast is cast to its target type
+/// via cudf::cast before being included in the key table.
+static join_keys_result prepare_join_keys(
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+  const std::vector<cudf::size_type>& left_key_col_indices,
+  const std::vector<cudf::size_type>& right_key_col_indices,
+  bool cast_necessary,
+  const std::vector<sirius_physical_hash_join::key_cast_info>& key_casts,
+  rmm::cuda_stream_view stream)
+{
+  join_keys_result result;
+
+  if (!cast_necessary) {
+    // Fast path: no casts needed, just select columns directly
+    result.left_keys = get_cudf_table_view(*input_batches[0]).select(left_key_col_indices);
+    result.right_keys = get_cudf_table_view(*input_batches[1]).select(right_key_col_indices);
+    return result;
+  }
+
+  // Slow path: iterate over key columns and cast where needed
+  cudf::table_view left_table = get_cudf_table_view(*input_batches[0]);
+  cudf::table_view right_table = get_cudf_table_view(*input_batches[1]);
+
+  for (size_t i = 0; i < left_key_col_indices.size(); i++) {
+    const auto& cast_info = key_casts[i];
+
+    // Left key column
+    cudf::column_view left_col = left_table.column(left_key_col_indices[i]);
+    if (cast_info.cast_left) {
+      printf("  casting left key column %zu from %s to %s\n",
+             i,
+             cudf::type_to_name(left_col.type()).c_str(),
+             cudf::type_to_name(cast_info.left_target_type).c_str());
+      auto cast_col = cudf::cast(left_col, cast_info.left_target_type, stream);
+      result.left_key_views.push_back(cast_col->view());
+      result.owned_cast_columns.push_back(std::move(cast_col));
+    } else {
+      result.left_key_views.push_back(left_col);
+    }
+
+    // Right key column
+    cudf::column_view right_col = right_table.column(right_key_col_indices[i]);
+    if (cast_info.cast_right) {
+      printf("  casting right key column %zu from %s to %s\n",
+             i,
+             cudf::type_to_name(right_col.type()).c_str(),
+             cudf::type_to_name(cast_info.right_target_type).c_str());
+      auto cast_col = cudf::cast(right_col, cast_info.right_target_type, stream);
+      result.right_key_views.push_back(cast_col->view());
+      result.owned_cast_columns.push_back(std::move(cast_col));
+    } else {
+      result.right_key_views.push_back(right_col);
+    }
+  }
+
+  // Build table_views from the column_view vectors
+  result.left_keys = cudf::table_view(result.left_key_views);
+  result.right_keys = cudf::table_view(result.right_key_views);
+  return result;
+}
+
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join::execute(
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
@@ -403,8 +540,10 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
   if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::RIGHT 
       || join_type == duckdb::JoinType::OUTER || join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI){
 
-    cudf::table_view left_keys = get_cudf_table_view(*input_batches[0]).select(left_key_col_indices);
-    cudf::table_view right_keys = get_cudf_table_view(*input_batches[1]).select(right_key_col_indices);
+    auto keys = prepare_join_keys(input_batches, left_key_col_indices, right_key_col_indices,
+                                  cast_necessary, key_casts, stream);
+    cudf::table_view left_keys = keys.left_keys;
+    cudf::table_view right_keys = keys.right_keys;
     // printf("left keys size: %zu\n", left_keys.num_rows());
     // printf("right keys size: %zu\n", right_keys.num_rows());
     // std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -446,13 +585,13 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
       
     std::vector<std::unique_ptr<cudf::column>> out_cols;
     if (collect_left) {
-      // printf("collect left\n");
-      // // print lhs_output_columns.col_idxs
-      // printf("  lhs_output_columns.col_idxs: [");
-      // for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
-      //   printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
-      // }
-      // printf("] (size=%zu)\n", lhs_output_columns.col_idxs.size());
+      printf("collect left\n");
+      // print lhs_output_columns.col_idxs
+      printf("  lhs_output_columns.col_idxs: [");
+      for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+        printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
+      }
+      printf("] (size=%zu)\n", lhs_output_columns.col_idxs.size());
       cudf::table_view left_cols_to_gather = get_cudf_table_view(*input_batches[0]).select(lhs_output_columns.col_idxs);
       cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
                                     left_indices->size(),
@@ -467,13 +606,13 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
       out_cols = left_result->release();
     }
     if (collect_right) {
-      // printf("collect right\n");
-      // // print rhs_output_columns.col_idxs
-      // printf("  rhs_output_columns.col_idxs: [");
-      // for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
-      //   printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
-      // }
-      // printf("] (size=%zu)\n", rhs_output_columns.col_idxs.size());
+      printf("collect right\n");
+      // print rhs_output_columns.col_idxs
+      printf("  rhs_output_columns.col_idxs: [");
+      for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+        printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
+      }
+      printf("] (size=%zu)\n", rhs_output_columns.col_idxs.size());
       cudf::table_view right_cols_to_gather = get_cudf_table_view(*input_batches[1]).select(rhs_output_columns.col_idxs);
       cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
                                       right_indices->size(),

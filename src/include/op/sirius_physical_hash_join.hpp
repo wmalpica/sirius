@@ -125,7 +125,20 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   bool is_equality_join = true;
   std::vector<cudf::size_type> left_key_col_indices;
   std::vector<cudf::size_type> right_key_col_indices;
-  
+  bool cast_necessary = false;
+
+ public:
+  //! Per-key cast info: whether each join key needs a cast before comparison
+  struct key_cast_info {
+    bool cast_left = false;
+    bool cast_right = false;
+    cudf::data_type left_target_type{cudf::type_id::EMPTY};
+    cudf::data_type right_target_type{cudf::type_id::EMPTY};
+  };
+
+ protected:
+  std::vector<key_cast_info> key_casts;
+
  public:
   // Sink Interface
   bool is_sink() const override { return true; }
