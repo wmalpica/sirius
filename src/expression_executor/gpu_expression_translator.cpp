@@ -38,16 +38,26 @@ gpu_expression_translator::translate_expression(duckdb::Expression const& expr,
 std::optional<expr_ref> gpu_expression_translator::add_join_condition(
   duckdb::JoinCondition const& condition, bool swap_sides)
 {
-  auto left_table_ref =
-    swap_sides ? cudf::ast::table_reference::RIGHT : cudf::ast::table_reference::LEFT;
-  auto right_table_ref =
-    swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT;
+  // auto left_table_ref =
+  //   swap_sides ? cudf::ast::table_reference::RIGHT : cudf::ast::table_reference::LEFT;
+  // auto right_table_ref =
+  //   swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT;
 
-  auto left_expr = add_expression(*condition.left, left_table_ref);
-  if (!left_expr) { return std::nullopt; }
+  std::optional<expr_ref> left_expr, right_expr;
+  if (swap_sides) {
+    left_expr = add_expression(*condition.right, cudf::ast::table_reference::LEFT);
+    if (!left_expr) { return std::nullopt; }
 
-  auto right_expr = add_expression(*condition.right, right_table_ref);
-  if (!right_expr) { return std::nullopt; }
+    right_expr = add_expression(*condition.left, cudf::ast::table_reference::RIGHT);
+    if (!right_expr) { return std::nullopt; }
+
+  } else {
+    left_expr = add_expression(*condition.left, cudf::ast::table_reference::LEFT);
+    if (!left_expr) { return std::nullopt; }
+
+    right_expr = add_expression(*condition.right, cudf::ast::table_reference::RIGHT);
+    if (!right_expr) { return std::nullopt; }
+  }
 
   switch (condition.comparison) {
     case duckdb::ExpressionType::COMPARE_EQUAL:
@@ -57,17 +67,37 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::NOT_EQUAL, *left_expr, *right_expr);
     case duckdb::ExpressionType::COMPARE_LESSTHAN:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
+      if (swap_sides) {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
+      } else {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
+      }
     case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
+      if (swap_sides) {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::LESS, *left_expr, *right_expr);
+      } else {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::GREATER, *left_expr, *right_expr);
+      }
     case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
+      if (swap_sides) {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+      } else {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
+      }
     case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-      return _ast_tree.emplace<cudf::ast::operation>(
-        cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+      if (swap_sides) {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::LESS_EQUAL, *left_expr, *right_expr);
+      } else {
+        return _ast_tree.emplace<cudf::ast::operation>(
+          cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+      }
     default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported join condition comparison type: {}",
                        condition.comparison);
@@ -431,6 +461,7 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
 std::optional<expr_ref> gpu_expression_translator::add_expression(
   duckdb::BoundReferenceExpression const& expr, cudf::ast::table_reference const table_src)
 {
+  SIRIUS_LOG_DEBUG("translator::add_expression {} index {}", table_src, expr.index);
   return _ast_tree.emplace<cudf::ast::column_reference>(expr.index, table_src);
 }
 

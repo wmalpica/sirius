@@ -16,6 +16,8 @@
 
 #include "op/sirius_physical_hash_join.hpp"
 
+#include "cudf/ast/detail/expression_transformer.hpp"
+#include "cudf/ast/detail/operators.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
@@ -24,6 +26,7 @@
 #include "cudf/types.hpp"
 #include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
+#include "cudf/utilities/type_dispatcher.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -35,7 +38,71 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cstdio>
+#include <sstream>
 #include <unordered_set>
+
+namespace {
+
+/// Visitor that renders a cuDF AST tree as an indented string for debug logging.
+struct ast_printer : cudf::ast::detail::expression_transformer {
+  std::reference_wrapper<cudf::ast::expression const> visit(cudf::ast::literal const& expr) override
+  {
+    oss_ << indent() << "Literal(type=" << cudf::type_to_name(expr.get_data_type()) << ")\n";
+    return expr;
+  }
+
+  std::reference_wrapper<cudf::ast::expression const> visit(
+    cudf::ast::column_reference const& expr) override
+  {
+    const char* side = [&] {
+      switch (expr.get_table_source()) {
+        case cudf::ast::table_reference::LEFT: return "LEFT";
+        case cudf::ast::table_reference::RIGHT: return "RIGHT";
+        case cudf::ast::table_reference::OUTPUT: return "OUTPUT";
+        default: return "UNKNOWN";
+      }
+    }();
+    oss_ << indent() << "ColumnRef(col=" << expr.get_column_index() << ", table=" << side << ")\n";
+    return expr;
+  }
+
+  std::reference_wrapper<cudf::ast::expression const> visit(
+    cudf::ast::operation const& expr) override
+  {
+    oss_ << indent() << "Op(" << cudf::ast::detail::ast_operator_string(expr.get_operator())
+         << ", arity=" << expr.get_operands().size() << ")\n";
+    depth_++;
+    for (auto const& operand : expr.get_operands()) {
+      operand.get().accept(*this);
+    }
+    depth_--;
+    return expr;
+  }
+
+  std::reference_wrapper<cudf::ast::expression const> visit(
+    cudf::ast::column_name_reference const& expr) override
+  {
+    oss_ << indent() << "ColumnNameRef(" << expr.get_column_name() << ")\n";
+    return expr;
+  }
+
+  std::string str() const { return oss_.str(); }
+
+ private:
+  std::string indent() const { return std::string(depth_ * 2, ' '); }
+  std::ostringstream oss_;
+  int depth_ = 0;
+};
+
+static std::string ast_tree_to_string(cudf::ast::tree const& tree)
+{
+  if (tree.size() == 0) { return "<empty>"; }
+  ast_printer printer;
+  tree.back().accept(printer);
+  return printer.str();
+}
+
+}  // anonymous namespace
 
 namespace sirius {
 namespace op {
@@ -546,6 +613,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
   cudf::table_view left_full  = get_cudf_table_view(*input_batches[0]);
   cudf::table_view right_full = get_cudf_table_view(*input_batches[1]);
 
+  SIRIUS_LOG_DEBUG("hash_join::execute: left_full rows={} cols={}, right_full rows={} cols={}",
+                   left_full.num_rows(),
+                   left_full.num_columns(),
+                   right_full.num_rows(),
+                   right_full.num_columns());
+
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
 
   if (is_mixed_join) {
@@ -560,9 +633,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     cudf::table_view left_eq  = keys.left_keys;
     cudf::table_view right_eq = keys.right_keys;
 
+    bool swap_sides =
+      (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_ANTI ||
+       join_type == duckdb::JoinType::RIGHT_SEMI)
+        ? true
+        : false;
+
     sirius::gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    auto pred =
-      translator.translate_join_conditions(conditions, num_equality_conditions, conditions.size());
+    auto pred = translator.translate_join_conditions(
+      conditions, num_equality_conditions, conditions.size(), swap_sides);
     if (!pred) {
       throw std::runtime_error(
         "In sirius_physical_hash_join: failed to translate mixed join inequality conditions to "
@@ -602,20 +681,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::RIGHT) {
-      // Implement as a swapped left join: right becomes the probe side, left becomes the build
-      // side. The predicate is rebuilt with LEFT/RIGHT table references flipped to match.
-      auto swapped_pred = translator.translate_join_conditions(
-        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
-      if (!swapped_pred) {
-        throw std::runtime_error(
-          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT mixed "
-          "join");
-      }
       auto result   = cudf::mixed_left_join(right_eq,
                                           left_eq,
                                           right_full,
                                           left_full,
-                                          swapped_pred->back(),
+                                          pred->back(),
                                           cudf::null_equality::UNEQUAL,
                                             {},
                                           stream);
@@ -649,33 +719,44 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                 cudf::null_equality::UNEQUAL,
                                                 stream);
     } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
-      auto swapped_pred = translator.translate_join_conditions(
-        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
-      if (!swapped_pred) {
-        throw std::runtime_error(
-          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_SEMI "
-          "mixed join");
+      SIRIUS_LOG_DEBUG(
+        "hash_join::execute RIGHT_SEMI: conditions count={}, "
+        "num_equality_conditions={}, inequality_conditions={}",
+        conditions.size(),
+        num_equality_conditions,
+        conditions.size() - num_equality_conditions);
+      for (std::size_t i = 0; i < conditions.size(); ++i) {
+        const auto& cond = conditions[i];
+        SIRIUS_LOG_DEBUG(
+          "hash_join::execute RIGHT_SEMI: conditions[{}]: comparison={}, left={}, right={}",
+          i,
+          duckdb::ExpressionTypeToString(cond.comparison),
+          cond.left ? cond.left->ToString() : "<null>",
+          cond.right ? cond.right->ToString() : "<null>");
+      }
+      if (pred) {
+        SIRIUS_LOG_DEBUG(
+          "hash_join::execute RIGHT_SEMI: pred has_value=true, tree_nodes={}, owned_literals={},"
+          " AST:\n{}",
+          pred->tree.size(),
+          pred->owned_literals.size(),
+          ast_tree_to_string(pred->tree));
+      } else {
+        SIRIUS_LOG_DEBUG("hash_join::execute RIGHT_SEMI: pred has_value=false");
       }
       right_indices = cudf::mixed_left_semi_join(right_eq,
                                                  left_eq,
                                                  right_full,
                                                  left_full,
-                                                 swapped_pred->back(),
+                                                 pred->back(),
                                                  cudf::null_equality::UNEQUAL,
                                                  stream);
     } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
-      auto swapped_pred = translator.translate_join_conditions(
-        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
-      if (!swapped_pred) {
-        throw std::runtime_error(
-          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_ANTI "
-          "mixed join");
-      }
       right_indices = cudf::mixed_left_anti_join(right_eq,
                                                  left_eq,
                                                  right_full,
                                                  left_full,
-                                                 swapped_pred->back(),
+                                                 pred->back(),
                                                  cudf::null_equality::UNEQUAL,
                                                  stream);
     } else {

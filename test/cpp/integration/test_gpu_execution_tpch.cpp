@@ -1310,9 +1310,21 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "order by l.l_orderkey, l.l_linenumber limit 1000;");
 }
 
+TEST_CASE_METHOD(
+  GPUExecutionFixture,
+  "gpu_execution - WSM REMOVE mixed right semi join one equality and one inequality condition",
+  "[integration][gpu_execution][fmixed_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, ps.ps_availqty  from partsupp ps semi join lineitem l "
+    "on l.l_partkey = ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where ps.ps_partkey < 1000 "
+    "order by ps.ps_partkey, ps.ps_suppkey limit 3000;");
+}
+
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - mixed right semi join one equality and one inequality condition",
-                 "[integration][gpu_execution][mixed_join]")
+                 "[integration][gpu_execution][fmixed_join]")
 {
   compare_gpu_vs_cpu(
     "select ps.ps_partkey, ps.ps_suppkey  from partsupp ps semi join lineitem l "
@@ -2178,7 +2190,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 21",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q21]")
+                 "[integration][gpu_execution][TPC-H][Q21]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, count(*) as numwait "
