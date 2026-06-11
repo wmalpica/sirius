@@ -175,6 +175,68 @@ Out lookup_supporting(Container const& ioctxs,
   return Out{};
 }
 
+// Device-resident bytes held by a single GPU-tier pinned entry: the sum of
+// cudf::column::alloc_size() over every cached column chunk.
+std::size_t gpu_entry_bytes(const pinned_entry& entry)
+{
+  std::size_t bytes = 0;
+  for (auto const& [col_name, chunks] : entry.data_batches_by_column) {
+    for (auto const& chunk : chunks) {
+      if (chunk) { bytes += chunk->alloc_size(); }
+    }
+  }
+  return bytes;
+}
+
+// Host-resident bytes held by a single HOST-tier pinned entry: the sum of
+// host_data_representation::get_size_in_bytes() over every pinned chunk.
+std::size_t host_entry_bytes(const pinned_entry& entry)
+{
+  std::size_t bytes = 0;
+  for (auto const& chunk : entry.host_chunks) {
+    if (chunk) { bytes += chunk->get_size_in_bytes(); }
+  }
+  return bytes;
+}
+
+// Report, at DEBUG level, how much memory the pinned-table cache now holds in
+// the tier the just-pinned table '@p name' landed in. Emitted on every pin so
+// the running footprint of the pinned set is visible for both the GPU and HOST
+// tiers; the message names the relevant space so the two tiers don't conflate.
+void log_pinned_memory_usage(std::unordered_map<std::string, pinned_entry> const& entries,
+                             const std::string& name)
+{
+  auto const it = entries.find(name);
+  if (it == entries.end()) { return; }
+  bool const is_host = it->second.tier == cucascade::memory::Tier::HOST;
+  std::size_t const this_table_bytes =
+    is_host ? host_entry_bytes(it->second) : gpu_entry_bytes(it->second);
+
+  // Sum across every pinned entry that lives in the same tier so the figure
+  // reflects total cache occupancy of that space, not just this one table.
+  std::size_t total_bytes = 0;
+  std::size_t table_count = 0;
+  for (auto const& [other_name, entry] : entries) {
+    if (entry.tier != it->second.tier) { continue; }
+    total_bytes += is_host ? host_entry_bytes(entry) : gpu_entry_bytes(entry);
+    ++table_count;
+  }
+
+  constexpr double kGiB  = 1024.0 * 1024.0 * 1024.0;
+  char const* tier_label = is_host ? "HOST" : "GPU";
+  SIRIUS_LOG_DEBUG(
+    "[sirius_scan_manager] pinned table '{}' on {} tier (+{} bytes / {:.3f} GiB for this table); "
+    "total pinned {} memory now {} bytes / {:.3f} GiB across {} pinned table(s)",
+    name,
+    tier_label,
+    this_table_bytes,
+    static_cast<double>(this_table_bytes) / kGiB,
+    tier_label,
+    total_bytes,
+    static_cast<double>(total_bytes) / kGiB,
+    table_count);
+}
+
 }  // namespace
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
@@ -425,6 +487,7 @@ void sirius_scan_manager::insert_pinned_entry(
           entry.column_names.push_back(std::move(cn));
         }
       }
+      log_pinned_memory_usage(_pinned_entries, name);
       return;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
@@ -453,6 +516,7 @@ void sirius_scan_manager::insert_pinned_entry(
   }
 
   _pinned_entries[name] = std::move(entry);
+  log_pinned_memory_usage(_pinned_entries, name);
 }
 
 void sirius_scan_manager::insert_pinned_entry_host(
@@ -485,6 +549,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.is_partial   = is_partial;
 
   _pinned_entries[name] = std::move(entry);
+  log_pinned_memory_usage(_pinned_entries, name);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(

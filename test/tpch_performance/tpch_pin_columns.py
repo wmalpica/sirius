@@ -201,6 +201,55 @@ QUERY_COLUMNS: dict[int, dict[str, list[str]]] = {
 }
 
 
+# Curated "most useful" column set for the --pin host_some option.
+#
+# This is NOT the per-query union (see _union_columns_by_table); it is the
+# hand-picked subset determined to give the best host-cache coverage under a
+# ~300 GB SF1000 budget: every small/medium table in full, plus the
+# highest-frequency lineitem columns, plus l_quantity. Tables/columns NOT
+# listed here (e.g. l_tax, l_commitdate, l_receiptdate, l_shipmode,
+# l_shipinstruct, o_comment) are intentionally left unpinned — queries that
+# reference them fall through to a disk read for that table (create_provider_for
+# requires the pinned set to be a SUPERSET of the columns a query reads, so a
+# query needing an unpinned column reads the whole table from disk).
+HOST_SOME_COLUMNS: dict[str, list[str]] = {
+    "lineitem": [
+        "l_extendedprice",
+        "l_discount",
+        "l_orderkey",
+        "l_shipdate",
+        "l_suppkey",
+        "l_partkey",
+        "l_returnflag",
+        "l_quantity",
+    ],
+    "orders": ["o_orderkey", "o_custkey", "o_orderdate", "o_shippriority"],
+    "customer": [
+        "c_custkey",
+        "c_nationkey",
+        "c_name",
+        "c_phone",
+        "c_acctbal",
+        "c_address",
+        "c_mktsegment",
+        "c_comment",
+    ],
+    "partsupp": ["ps_partkey", "ps_suppkey", "ps_supplycost", "ps_availqty"],
+    "part": ["p_partkey", "p_type", "p_mfgr", "p_size", "p_brand"],
+    "supplier": [
+        "s_suppkey",
+        "s_nationkey",
+        "s_name",
+        "s_address",
+        "s_phone",
+        "s_comment",
+        "s_acctbal",
+    ],
+    "nation": ["n_nationkey", "n_name", "n_regionkey"],
+    "region": ["r_regionkey", "r_name"],
+}
+
+
 def detect_pin_glob(parquet_dir: str, table: str) -> str:
     """Return a glob whose expansion matches the file list of the existing CREATE VIEW.
 
@@ -285,6 +334,32 @@ def emit_unpin_all() -> str:
             f"CALL unpin_table('{table}');" for table in _union_columns_by_table()
         )
         + "\n"
+    )
+
+
+def emit_pin_some(parquet_dir: str) -> str:
+    """Emit one CALL pin_table per table for the curated HOST_SOME_COLUMNS set.
+
+    Like emit_pin_all (used for --pin host/gpu), but pins only the hand-picked
+    "most useful" subset rather than the full per-query union. Intended for
+    --pin host_some, which is sequential-mode only: pin the subset once up front
+    and serve every query's pinned columns from the host cache, letting queries
+    that touch unpinned columns fall through to disk.
+    """
+    tier = os.environ.get("SIRIUS_PIN_TIER", "host")
+    lines = []
+    for table, cols in HOST_SOME_COLUMNS.items():
+        path = detect_pin_glob(parquet_dir, table)
+        col_literals = ",".join(f"'{c}'" for c in cols)
+        lines.append(
+            f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def emit_unpin_some() -> str:
+    return (
+        "\n".join(f"CALL unpin_table('{table}');" for table in HOST_SOME_COLUMNS) + "\n"
     )
 
 

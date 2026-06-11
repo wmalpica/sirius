@@ -29,8 +29,10 @@ from queries import QUERIES
 from tpch_pin_columns import (
     emit_pin,
     emit_pin_all,
+    emit_pin_some,
     emit_unpin,
     emit_unpin_all,
+    emit_unpin_some,
 )
 
 
@@ -48,7 +50,7 @@ def log(msg):
 
 MODES = ("grouped", "sequential", "isolated")
 ENGINE_CHOICES = ("gpu", "cpu", "both")
-PIN_CHOICES = ("none", "gpu", "host")
+PIN_CHOICES = ("none", "gpu", "host", "host_some")
 TPCH_TABLES = (
     "customer",
     "lineitem",
@@ -389,12 +391,25 @@ def run_sequential(
     """Round-robin iterations; one connection per engine. Single union-pin at session start."""
     log("Mode 'sequential': single connection per engine, round-robin iterations")
     pin_enabled = pin != "none"
+    # host_some pins only the curated "most useful" column subset; every other
+    # pin tier pins the full per-query union.
+    pin_some = pin == "host_some"
     for name, use_gpu in engine_modes:
         con = open_connection(source, gpu_execution=use_gpu)
         try:
             if pin_enabled and use_gpu:
-                log("  Union-pinning all referenced TPC-H tables once at session start")
-                _execute_multi(con, emit_pin_all(parquet_dir))
+                if pin_some:
+                    log(
+                        "  Pinning curated most-useful column subset once at "
+                        "session start (--pin host_some)"
+                    )
+                    _execute_multi(con, emit_pin_some(parquet_dir))
+                else:
+                    log(
+                        "  Union-pinning all referenced TPC-H tables once at "
+                        "session start"
+                    )
+                    _execute_multi(con, emit_pin_all(parquet_dir))
             try:
                 for it in range(iterations):
                     for qnum in queries:
@@ -411,8 +426,12 @@ def run_sequential(
                         )
             finally:
                 if pin_enabled and use_gpu:
-                    log("  Union-unpinning all TPC-H tables")
-                    _execute_multi(con, emit_unpin_all())
+                    if pin_some:
+                        log("  Unpinning curated most-useful column subset")
+                        _execute_multi(con, emit_unpin_some())
+                    else:
+                        log("  Union-unpinning all TPC-H tables")
+                        _execute_multi(con, emit_unpin_all())
         finally:
             log("Closing connection")
             con.close()
@@ -661,9 +680,11 @@ def parse_args():
         default="none",
         help=(
             "Pin TPC-H tables into the Sirius cache (Sirius-only). 'gpu' or "
-            "'host' selects the cache tier; 'none' disables pinning. Pin is "
-            "per-query in grouped/isolated mode and a single union-pin at "
-            "session start in sequential mode. (default: none)"
+            "'host' selects the cache tier and pins the full per-query column "
+            "union; 'host_some' pins only the curated 'most useful' column "
+            "subset to the host tier (requires --mode sequential); 'none' "
+            "disables pinning. Pin is per-query in grouped/isolated mode and a "
+            "single pin at session start in sequential mode. (default: none)"
         ),
     )
     p.add_argument(
@@ -707,6 +728,13 @@ def main():
     if args.pin != "none" and args.engine == "cpu":
         raise SystemExit("--pin is Sirius-only; cannot be combined with --engine cpu")
 
+    if args.pin == "host_some" and args.mode != "sequential":
+        raise SystemExit(
+            "--pin host_some requires --mode sequential (the curated subset is "
+            "pinned once at session start; per-query pinning is not supported "
+            f"for it). Got --mode {args.mode}."
+        )
+
     if args.validation and args.engine != "both":
         raise SystemExit(
             "--validation requires --engine both (needs both result sets to compare)"
@@ -722,7 +750,9 @@ def main():
         )
 
     if args.pin != "none":
-        os.environ["SIRIUS_PIN_TIER"] = args.pin
+        # host_some is a host-tier pin with a curated column subset; the engine
+        # only knows the 'gpu'/'host' tiers, so map it onto 'host'.
+        os.environ["SIRIUS_PIN_TIER"] = "host" if args.pin == "host_some" else args.pin
 
     benchmark_dir, runtime_csv, log_dir = setup_benchmark_dir(
         output_root,
