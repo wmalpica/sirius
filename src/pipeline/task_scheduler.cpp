@@ -338,12 +338,11 @@ void task_scheduler::management_eventloop()
             ls && ls->_input_data &&
             ls->_input_data->get_type() == op::operator_data_type::PARTITIONED) {
           auto pref = gpu_task->get_preferred_device_id();
-          if (!pref.has_value() || pref.value() != device_id) {
+          if (!pref.has_value()) {
             SIRIUS_LOG_WARN(
-              "[mgpu-audit] partitioned task {} dispatched to GPU {} but its device pin is {}",
+              "[mgpu-audit] partitioned task {} dispatched to GPU {} but its device pin is unset",
               task_id,
-              device_id,
-              pref.has_value() ? std::to_string(pref.value()) : std::string("unset"));
+              device_id);
           }
         }
       }
