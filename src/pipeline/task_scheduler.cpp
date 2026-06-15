@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -331,6 +332,20 @@ void task_scheduler::management_eventloop()
       uint64_t task_id = 0;
       if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
         task_id = gpu_task->get_task_id();
+        // Lets check here that if the task has input that is partitioned, it is pinned to the
+        // correct device.
+        if (auto* ls = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
+            ls && ls->_input_data &&
+            ls->_input_data->get_type() == op::operator_data_type::PARTITIONED) {
+          auto pref = gpu_task->get_preferred_device_id();
+          if (!pref.has_value() || pref.value() != device_id) {
+            SIRIUS_LOG_WARN(
+              "[mgpu-audit] partitioned task {} dispatched to GPU {} but its device pin is {}",
+              task_id,
+              device_id,
+              pref.has_value() ? std::to_string(pref.value()) : std::string("unset"));
+          }
+        }
       }
       // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
       // load-bearing — verification greps depend on it.
