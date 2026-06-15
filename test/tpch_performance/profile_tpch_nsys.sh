@@ -38,6 +38,12 @@ ITERATIONS=${ITERATIONS:-2}
 # Per-query timeout in seconds (covers both iterations + nsys overhead).
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-90}
 SCAN_CACHE_LEVEL="${SCAN_CACHE_LEVEL:-}"
+# Pin TPC-H tables into the Sirius cache before running each query (grouped
+# semantics: pin -> iterations -> unpin, one process per query). Set to the
+# cache tier, e.g. PIN_TIER=host or PIN_TIER=gpu. Empty disables pinning.
+# Mirrors performance_test.py --pin <tier> --mode grouped.
+PIN_TIER="${PIN_TIER:-}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <scale_factor> [query_numbers...]"
@@ -109,6 +115,7 @@ echo "Queries      : ${QUERIES[*]}"
 echo "Output dir   : $OUTPUT_DIR"
 echo "Config       : ${SIRIUS_CONFIG_FILE:-<not set>}"
 echo "Cache level  : ${SCAN_CACHE_LEVEL:-<default>}"
+echo "Pin tier     : ${PIN_TIER:-<none>}"
 echo "nsys version : $(nsys --version 2>&1 | head -1)"
 echo "============================================"
 echo ""
@@ -178,6 +185,21 @@ for q in "${QUERIES[@]}"; do
     fi
     printf "INSERT INTO _timings VALUES (1, 'views', current_timestamp);\n" >> "$TEMP_SQL"
 
+    # Pin this query's tables/columns into the Sirius cache (grouped semantics:
+    # pin before all iterations, unpin after). Glob/tier come from
+    # tpch_pin_columns.py, same helper performance_test.py uses.
+    if [ -n "$PIN_TIER" ]; then
+        if ! PIN_SQL=$(SIRIUS_PIN_TIER="$PIN_TIER" "$PYTHON_BIN" "$SCRIPT_DIR/tpch_pin_columns.py" pin "$q" "$PARQUET_DIR"); then
+            echo "[Q${q}] SKIP - failed to emit pin SQL"
+            write_summary_line "Q${q}" "SKIP"
+            ((SKIPPED++))
+            rm -f "$TEMP_SQL"
+            continue
+        fi
+        UNPIN_SQL=$("$PYTHON_BIN" "$SCRIPT_DIR/tpch_pin_columns.py" unpin "$q")
+        printf '%s\n' "$PIN_SQL" >> "$TEMP_SQL"
+    fi
+
     for ((i = 1; i <= ITERATIONS; i++)); do
         # Start nsys capture before hot iterations (skip cold run)
         if [ "$i" -eq 2 ]; then
@@ -190,6 +212,11 @@ for q in "${QUERIES[@]}"; do
     # Stop nsys capture after all iterations
     if [ "$ITERATIONS" -ge 2 ]; then
         printf "CALL profiler_stop();\n" >> "$TEMP_SQL"
+    fi
+
+    # Unpin after all iterations (released outside the captured range).
+    if [ -n "$PIN_TIER" ]; then
+        printf '%s\n' "$UNPIN_SQL" >> "$TEMP_SQL"
     fi
 
     # Extract per-step timings
