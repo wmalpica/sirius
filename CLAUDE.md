@@ -49,6 +49,20 @@ work targets Super Sirius. Memory spilling / CPU fallback is handled by the down
 Before implementing operators / memory / expression / I/O work, run `/module-context <task>` to
 load accurate cudf/rmm/duckdb/cucascade API docs.
 
+## Code comments
+
+Write comments that describe the code **as it is now**, in terms of the system's actual
+behavior and architecture. A comment must make sense to someone reading the merged code with
+no knowledge of how it used to be or what changed.
+
+- **Do not** describe edits, diffs, or history: no "changed X to Y", "now uses…",
+  "previously…", "this was added to fix…", "moved from…". After the PR merges there is no
+  "before", so such comments only confuse.
+- **Do not** reference task-tracking or traceability artifacts — issue/ticket numbers,
+  requirement IDs, GSD subtask codes, PR numbers — unless the developer explicitly asks for them.
+- Explain *why the code is the way it is* in terms of the current design, not in terms of the
+  change that produced it.
+
 ## Usage
 
 Load the extension and run normal SQL — Sirius intercepts it transparently and runs supported
