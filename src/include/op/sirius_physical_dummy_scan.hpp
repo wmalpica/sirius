@@ -37,10 +37,16 @@ class sirius_physical_dummy_scan : public sirius_physical_operator {
  public:
   bool is_source() const override { return true; }
 
+  //! The RIGHT_DELIM_JOIN build placeholder contributes no pipeline operator: the delim join
+  //! fans its input directly to PARTITION_build, so the placeholder carries no runtime data.
+  //! Real DUMMY_SCANs (constant-row subqueries) use the base source-leaf behavior.
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   //! True when this DUMMY_SCAN is the synthetic build placeholder under a
   //! RIGHT_DELIM_JOIN's internal join. Makes plan-gen skip `wrap_cpu_source`: the
-  //! placeholder carries no runtime data (sink() runs partition_join inline). Real
-  //! DUMMY_SCAN usages (constant-row subqueries) keep the wrap.
+  //! placeholder carries no runtime data. Real DUMMY_SCAN usages (constant-row
+  //! subqueries) keep the wrap.
   [[nodiscard]] bool is_delim_join_placeholder() const noexcept
   {
     return _is_delim_join_placeholder;
