@@ -543,14 +543,28 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions,
     // fresh right-sized vector and move-assign it (steals the buffer, no element moves).
     _partition_build_states =
       std::vector<per_partition_build_state>(static_cast<std::size_t>(num_partitions));
-    SIRIUS_LOG_DEBUG(
-      "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions ({} GPUs) "
-      "and build side size {} bytes",
-      this->get_operator_id(),
-      num_partitions,
-      _num_gpus,
-      build_side_bytes);
   }
+
+  // The per-side cardinality estimates are the DuckDB planner estimates stamped onto the join's
+  // children (children[0] = probe/left, children[1] = build/right).
+  const char* join_mode_str        = _join_mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
+                                     : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
+                                                                                : "STANDARD";
+  const std::size_t probe_card_est = children.size() > 0 ? children[0]->estimated_cardinality : 0;
+  const std::size_t build_card_est = children.size() > 1 ? children[1]->estimated_cardinality : 0;
+  SIRIUS_LOG_INFO(
+    "sirius_physical_hash_join::update_join_exec_mode id {} join_type {} num_partitions {} "
+    "num_gpus {} build_size_bytes {} join_mode {} is_broadcast_candidate {} "
+    "build_card_est {} probe_card_est {}",
+    this->get_operator_id(),
+    duckdb::JoinTypeToString(join_type),
+    num_partitions,
+    _num_gpus,
+    build_side_bytes,
+    join_mode_str,
+    is_broadcast_candidate,
+    build_card_est,
+    probe_card_est);
 }
 
 bool sirius_physical_hash_join::is_build_probe_mode()
