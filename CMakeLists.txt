@@ -283,6 +283,9 @@ set(EXTENSION_SOURCES
     src/exec/admission_control.cpp
     src/exec/batch_stream.cpp
     src/exec/stream_session.cpp
+    src/exec/stream_bind_catalog.cpp
+    src/exec/stream_plan_bindings.cpp
+    src/exec/streaming_fragment.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -373,6 +376,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/data_size_estimator.cpp
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
@@ -444,6 +448,7 @@ set(CUDA_SOURCES
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/cuda/sirius_dynamic_small_in_list_filter.cu
+    src/cuda/sirius_like_multiliteral.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -677,7 +682,10 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/exec/test_semi_future.cpp
+    test/cpp/exec/test_sirius_ffi_fragment.cpp
+    test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_stream_session.cpp
+    test/cpp/exec/test_streaming_fragment.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
@@ -690,6 +698,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
+    test/cpp/expression_evaluator/test_like_multiliteral.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -748,7 +757,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
-    test/cpp/operator/test_mgpu_stress.cpp
+    test/cpp/operator/test_task_scheduler_routing.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
@@ -806,6 +815,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
+    test/cpp/pipeline/test_data_size_estimator.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp

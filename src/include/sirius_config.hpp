@@ -104,10 +104,14 @@ constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 102
 
 }  // namespace config
 
-/// Parameters controlling operator-level resource sizing.
-/// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
-/// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+/// Operator parameters shared between planning and execution.
+/// Fields are YAML-configurable unless documented as engine-owned; test-only DuckDB SET hooks
+/// require `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 struct operator_params {
+  /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
+  /// execution context stays fail-closed until the engine snapshots the connection value.
+  bool like_swar_fastpath = false;
+
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::derived_default_batch_size();
 

@@ -94,6 +94,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -1832,6 +1833,11 @@ static void SiriusVectorSearchFunction(ClientContext& context,
 
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
+  // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
+  // it wherever Sirius is loaded, not just on the FFI's embedded DuckDB, so a fragment plan binds
+  // on the transparent path too.
+  sirius::exec::register_stream_source_function(instance);
+
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
 
@@ -1931,9 +1937,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 
 // Process-global Config writes are refused once the Sirius runtime is
 // latched unavailable (stable, session-preserving error). Connection-local
-// settings (gpu_execution, enable_duckdb_fallback) and operator_params
-// setters are not gated here; the latter serialize via
-// lock_operator_params_slot instead.
+// settings (gpu_execution, enable_duckdb_fallback, fuse_merge_pipelines,
+// like_swar_fastpath) and operator_params setters are not gated here; the latter
+// serialize via lock_operator_params_slot instead.
 static void throw_if_sirius_runtime_unavailable(ClientContext& context)
 {
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2065,6 +2071,13 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   throw_if_sirius_runtime_unavailable(context);
   Config::ENABLE_REGEX_JIT_IMPL = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
+}
+
+static void SetEnableLikeSwarFastpath(ClientContext& /*context*/,
+                                      SetScope /*scope*/,
+                                      Value& /*parameter*/)
+{
+  // DuckDB stores this setting in the client context.
 }
 
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -2631,6 +2644,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
                     SetEnableRegexJitImpl);
+
+  // Add in config option for the multi-literal LIKE SWAR fast path
+  config.AddExtensionOption(
+    "like_swar_fastpath",
+    "Whether '%lit1%lit2%...%' LIKE patterns take the SWAR digram fast-path kernel instead of "
+    "cudf::strings::like",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(true),
+    SetEnableLikeSwarFastpath);
 
 #ifdef SIRIUS_ENABLE_LEGACY
   // Add in config options for modified pipeline
