@@ -283,6 +283,10 @@ struct sirius_config {
 
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
+  [[nodiscard]] int max_concurrent_queries() const noexcept
+  {
+    return _scan_manager_config.max_concurrent_queries;
+  }
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
