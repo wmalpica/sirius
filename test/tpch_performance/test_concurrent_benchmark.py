@@ -35,6 +35,7 @@ def arguments(**overrides):
         query_timeout=3,
         validation_memory_limit_mb=1,
         queries="1,6",
+        scale_factor="1",
         duckdb_profiling=False,
     )
     return argparse.Namespace(**(defaults | overrides))
@@ -82,9 +83,10 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
             root.execute("create table sample as select range as i from range(100)")
             out = io.StringIO()
             budget = cb.CaptureBudget(1 << 20)
-            with patch.dict(
-                perf.QUERIES,
-                {
+            with patch.object(
+                perf,
+                "queries_for_scale_factor",
+                return_value={
                     "q1": "select sum(i) from sample",
                     "q6": "select count(*) from sample",
                 },
@@ -164,6 +166,44 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
         self.assertEqual(budget.used, 0)
         self.assertTrue(all(r["status"] == "success" for r in records))
 
+    def test_concurrent_q11_uses_requested_scale_factor(self):
+        root = duckdb.connect(":memory:")
+        try:
+            root.execute(
+                "create table nation as select 1 n_nationkey, 'GERMANY' n_name"
+            )
+            root.execute("create table supplier as select 1 s_suppkey, 1 s_nationkey")
+            root.execute(
+                "create table partsupp as select * from (values "
+                "(1, 100000, 1, 1), (2, 5, 1, 1)) "
+                "t(ps_partkey, ps_supplycost, ps_availqty, ps_suppkey)"
+            )
+            for scale_factor, expected in (
+                ("1", [(1, 100000)]),
+                ("10", [(1, 100000), (2, 5)]),
+            ):
+                with self.subTest(scale_factor=scale_factor):
+                    output = io.StringIO()
+                    records, captures, errors = cb.run_phase(
+                        root,
+                        arguments(scale_factor=scale_factor, iterations=1),
+                        "duckdb",
+                        Path("."),
+                        [11],
+                        True,
+                        cb.CaptureBudget(1 << 20),
+                        csv.DictWriter(output, fieldnames=cb.FIELDS),
+                        output,
+                    )
+                    self.assertFalse(errors)
+                    self.assertEqual(len(records), 2)
+                    self.assertEqual(len(captures), 2)
+                    self.assertTrue(all(r["status"] == "success" for r in records))
+                    for rows in captures.values():
+                        self.assertEqual(rows, expected)
+        finally:
+            root.close()
+
     def test_setup_failure_breaks_barrier(self):
         class Root:
             def cursor(self):
@@ -188,8 +228,10 @@ class ConcurrentBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = duckdb.connect()
             output = io.StringIO()
-            with patch.dict(
-                perf.QUERIES, {"q1": "select * from missing_table", "q6": "select 42"}
+            with patch.object(
+                perf,
+                "queries_for_scale_factor",
+                return_value={"q1": "select * from missing_table", "q6": "select 42"},
             ):
                 records, _, errors = cb.run_phase(
                     root,

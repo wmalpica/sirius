@@ -224,6 +224,7 @@ def supervise(args, directory, config_path, validate, references, compression_pl
 
     directory = Path(directory).resolve()
     queries = perf.parse_query_spec(args.queries)
+    query_texts = perf.queries_for_scale_factor(args.scale_factor)
     limit, resolved_config = configured_limit(config_path)
     if resolved_config:
         # Freeze configuration for the child, including implicit startup discovery.
@@ -251,7 +252,7 @@ def supervise(args, directory, config_path, validate, references, compression_pl
             "run_timeout_s": args.run_timeout,
             "input_identity": input_identity(args),
             "query_sha256": {
-                str(q): hashlib.sha256(perf.QUERIES[f"q{q}"].encode()).hexdigest()
+                str(q): hashlib.sha256(query_texts[f"q{q}"].encode()).hexdigest()
                 for q in queries
             },
             "runtime_file": "csv/concurrent_runtimes.csv",
@@ -386,6 +387,9 @@ def execute_request(connection, sql, timeout, capture, budget):
 
 def run_phase(root, args, engine, directory, queries, capture, budget, writer, output):
     """Worker connections all derive from root; SQL never executes under the record lock."""
+    import performance_test as perf
+
+    query_texts = perf.queries_for_scale_factor(args.scale_factor)
     use_gpu = engine == "sirius"
     orders = orders_for(queries, args.concurrency, args.stream_order or "permuted")
     records, captures, setup_errors = [], {}, []
@@ -427,11 +431,9 @@ def run_phase(root, args, engine, directory, queries, capture, budget, writer, o
                                 path / f"profile_iter{iteration}.json"
                             ).replace("'", "''")
                             con.execute(f"PRAGMA profiling_output='{sql_path}'")
-                        import performance_test as perf
-
                         start, end, count, rows, status, error = execute_request(
                             con,
-                            perf.QUERIES[f"q{query}"],
+                            query_texts[f"q{query}"],
                             args.query_timeout,
                             capture,
                             budget,
