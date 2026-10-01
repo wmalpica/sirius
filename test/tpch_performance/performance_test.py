@@ -228,6 +228,7 @@ def setup_benchmark_dir(
     precmd="none",
     data_source="parquet",
     duckdb_results_source=None,
+    concurrency=1,
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -246,8 +247,12 @@ def setup_benchmark_dir(
     with `name` appended when given -- a label narrows the directory down within
     a run's other output rather than replacing the parameters that identify it.
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime(
+        "%Y%m%d_%H%M%S_%f" if concurrency > 1 else "%Y%m%d_%H%M%S"
+    )
     benchmark_name = f"tpch_{ts}_{profile_label}_{engine}_iter{iterations}"
+    if concurrency > 1:
+        benchmark_name += f"_c{concurrency}"
     if name:
         benchmark_name = f"{benchmark_name}_{name}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
@@ -1547,6 +1552,30 @@ def validate(sirius_dir, duckdb_dir, queries):
 def parse_args():
     p = argparse.ArgumentParser(description="Run TPC-H performance tests")
     p.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Concurrent read-only clients sharing one runtime (default: 1); independent of Sirius admission",
+    )
+    p.add_argument(
+        "--stream-order",
+        choices=("same", "permuted"),
+        default=None,
+        help="Concurrent stream order: selected query order or deterministic TPC-H permutations (default: permuted); requires concurrency > 1",
+    )
+    p.add_argument(
+        "--run-timeout",
+        type=float,
+        default=3600,
+        help="Whole concurrent benchmark watchdog in seconds, including setup/cleanup (default: 3600; 0 disables)",
+    )
+    p.add_argument(
+        "--validation-memory-limit-mb",
+        type=int,
+        default=1024,
+        help="Concurrent validation capture budget across all streams/engines in MiB (default: 1024)",
+    )
+    p.add_argument(
         "--input",
         type=str,
         required=True,
@@ -1750,7 +1779,8 @@ def parse_args():
         default=90,
         help=(
             "Per-query subprocess timeout in seconds for `--precmd nsys|gdb` "
-            "(default: 90). Ignored by --precmd none."
+            "(default: 90). Also applies to concurrent requests, including admission wait; "
+            "0 disables the concurrent request timeout. Ignored by the serial in-process runner."
         ),
     )
     p.add_argument(
@@ -1793,6 +1823,9 @@ def _resolve_duckdb_results_dir(path):
 
 def main():
     args = parse_args()
+    from concurrent_benchmark import check_arguments
+
+    check_arguments(args)
     if args.scale_factor is None:
         log(
             "WARNING: --scale-factor was not provided; defaulting to SF1. "
@@ -1909,6 +1942,11 @@ def main():
     # No --profile means change nothing: the profile is inert and the config
     # below is left exactly as the user wrote it.
     profile = PROFILES[args.profile] if args.profile is not None else DEFAULT_PROFILE
+    if args.concurrency > 1:
+        profile = {
+            **profile,
+            "summary": "shared cache, no resets; query order follows --stream-order; union pin only",
+        }
     # --mode overrides ordering and the drop placement, and forces a cache drop
     # at that placement (its defining property). Any cache mode/eviction the
     # profile asked for is kept.
@@ -1962,8 +2000,11 @@ def main():
         precmd=precmd,
         data_source=args.data_source,
         duckdb_results_source=duckdb_results_dir,
+        concurrency=args.concurrency,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
+    if args.concurrency > 1:
+        runtime_csv = os.path.join(benchmark_dir, "csv", "concurrent_runtimes.csv")
 
     # Set before any connection opens: Sirius reads SIRIUS_CONFIG_FILE at LOAD.
     if not cache_overrides:
@@ -1996,6 +2037,20 @@ def main():
     log(f"Benchmark dir: {benchmark_dir}")
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
+
+    if args.concurrency > 1:
+        from concurrent_benchmark import supervise
+
+        raise SystemExit(
+            supervise(
+                args,
+                benchmark_dir,
+                config_path,
+                do_validate,
+                duckdb_results_dir,
+                PIN_COMPRESSION_PLAN_DIR,
+            )
+        )
 
     # Best-effort: a profile that REQUIRES a cold cache already failed the
     # sanity check above when sudo is unavailable, so reaching here without it
