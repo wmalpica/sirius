@@ -174,11 +174,8 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
 static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
 {
   yaml::reader r(node, "task_creator");
-  if (r.has("strategy")) {
-    throw std::runtime_error(
-      "'sirius.executor.task_creator.strategy': removed; task creation policy is internal and "
-      "currently demand-driven; remove this key");
-  }
+  r.optional("strategy", opt.strategy);
+  r.optional("lookahead_wait_for_dynamic_filters", opt.lookahead_wait_for_dynamic_filters);
   if (r.has("priority_order")) {
     throw std::runtime_error(
       "'sirius.executor.task_creator.priority_order': removed; scheduling priority is internal "
@@ -744,6 +741,10 @@ parsed_sirius_config::parsed_sirius_config(std::shared_ptr<const Impl> impl)
 {
 }
 
+const creator::task_creator_config& parsed_sirius_config::get_task_creator_config() const noexcept
+{
+  return impl_->settings.get_task_creator_config();
+}
 const operator_params& parsed_sirius_config::get_operator_params() const noexcept
 {
   return impl_->settings.get_operator_params();

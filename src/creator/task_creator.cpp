@@ -21,6 +21,7 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "pipeline/task_submission.hpp"
@@ -41,6 +42,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace sirius::creator {
@@ -183,13 +185,17 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
 
   std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
   state->lookahead_queue.clear();
-  auto scan_operators            = query.get_scan_operators();
-  state->index_of_next_lookahead = 0;
+  auto scan_operators = query.get_scan_operators();
+
   if (!scan_operators.empty()) {
     auto begin = scan_operators.begin() + 1;
     for (auto it = begin; it != scan_operators.end(); ++it) {
       state->lookahead_queue.push_back(*it);
     }
+  }
+  state->lookahead_progress = std::make_shared<lookahead_candidates>(state->lookahead_queue.size());
+  if (_config.strategy == request_type::lookahead && _config.lookahead_wait_for_dynamic_filters) {
+    prepare_lookahead_filters(query, *state);
   }
 }
 
@@ -525,6 +531,116 @@ void task_creator::report_fatal_error(sirius::query_id_t query_id,
   if (state && state->completion_handler) state->completion_handler->report_error(error);
 }
 
+void task_creator::prepare_lookahead_filters(const planner::query& query,
+                                             query_task_global_state& state)
+{
+  std::unordered_map<pipeline::sirius_pipeline const*, std::size_t> scan_ranks;
+  auto const& scans = query.get_scan_operators();
+  for (std::size_t rank = 0; rank < scans.size(); ++rank) {
+    if (auto pipe = scans[rank]->get_pipeline()) scan_ranks.emplace(pipe.get(), rank);
+  }
+  for (auto* node : state.lookahead_queue) {
+    auto* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(node);
+    if (!scan || !scan->consumer() || scan->consumer()->decode_bindings().empty()) continue;
+    auto& gate   = state.lookahead_filters[node];
+    gate.channel = scan->consumer()->channel();
+    for (auto const& binding : scan->consumer()->decode_bindings()) {
+      gate.columns.push_back(binding.output_ordinal);
+    }
+    auto const rank = scan_ranks.find(scan->get_pipeline().get());
+    if (rank == scan_ranks.end()) {
+      gate.independent = false;
+      continue;
+    }
+    std::unordered_set<op::sirius_physical_hash_join*> joins;
+    for (auto const& pipe : query.get_pipelines()) {
+      for (auto& op_ref : pipe->get_operators()) {
+        auto* join = dynamic_cast<op::sirius_physical_hash_join*>(&op_ref.get());
+        if (!join || !joins.insert(join).second) continue;
+        auto const& plan = join->dynamic_filter_session().plan();
+        for (auto const& target : plan.probe_targets()) {
+          if (target.filter_set != gate.channel) continue;
+          ++gate.known_producers;
+          if (!std::ranges::any_of(target.key_bindings, [&](auto const& binding) {
+                return std::ranges::find(gate.columns, binding.channel_push_ordinal) !=
+                       gate.columns.end();
+              }))
+            continue;
+          if (target.route_class != op::dynamic_filter_route_class::scan) {
+            gate.independent = false;
+            continue;
+          }
+          std::vector<std::optional<std::size_t>> roots;
+          std::unordered_set<pipeline::sirius_pipeline const*> visiting, visited;
+          auto walk = [&](auto* current, auto&& self) -> void {
+            if (!current || visiting.contains(current)) {
+              roots.push_back({});
+              return;
+            }
+            if (visited.contains(current)) return;
+            visiting.insert(current);
+            auto found = scan_ranks.find(current);
+            if (found != scan_ranks.end()) roots.push_back(found->second);
+            auto inputs = current->get_ingress_ports_info();
+            if (inputs.empty() && found == scan_ranks.end()) roots.push_back({});
+            for (auto const& [producer, barrier] : inputs) {
+              auto upstream = producer ? producer->get_pipeline() : nullptr;
+              self(upstream.get(), self);
+            }
+            visiting.erase(current);
+            visited.insert(current);
+          };
+          auto* build = join->try_get_port("build");
+          walk(build ? build->src_pipeline.get() : nullptr, walk);
+          gate.independent = gate.independent && can_wait_for_build(rank->second, roots);
+        }
+      }
+    }
+    // Unmapped/manual producers or unscoped targets cannot establish an independent build.
+    gate.independent = gate.independent && gate.known_producers > 0 &&
+                       gate.known_producers == gate.channel->num_producers() &&
+                       !gate.channel->has_unscoped_producer();
+    if (gate.independent && _task_scheduler) {
+      gate.channel->observe_wakeup(_task_scheduler->policy_wakeup());
+    }
+  }
+}
+
+bool task_creator::defer_lookahead(op::sirius_physical_operator* node,
+                                   query_task_global_state& state)
+{
+  if (!_config.lookahead_wait_for_dynamic_filters) return false;
+  auto const found = state.lookahead_filters.find(node);
+  if (found == state.lookahead_filters.end()) return false;
+  auto const& gate = found->second;
+  auto* scan       = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(node);
+  if (!scan || (!scan->decode_consumer() && !scan->cached_view_possible())) return false;
+  auto status      = gate.channel->readiness_for(gate.columns);
+  auto const index = static_cast<std::size_t>(
+    std::find(state.lookahead_queue.begin(), state.lookahead_queue.end(), node) -
+    state.lookahead_queue.begin());
+  if (!gate.independent || !status.registration_frozen) {
+    SIRIUS_LOG_TRACE("Task Creator: lookahead bypass operator {}: producer independence unknown",
+                     node->get_operator_id());
+    return false;
+  }
+  if (status.pending_producers > 0) {
+    if (state.lookahead_progress->defer(index)) {
+      SIRIUS_LOG_TRACE("Task Creator: lookahead deferred operator {}: {} filter producers pending",
+                       node->get_operator_id(),
+                       status.pending_producers);
+    }
+    return true;
+  }
+  if (auto elapsed = state.lookahead_progress->release_deferral(index)) {
+    SIRIUS_LOG_TRACE("Task Creator: lookahead released operator {} after {:.3f} ms: {} filters",
+                     node->get_operator_id(),
+                     *elapsed,
+                     status.published_filters);
+  }
+  return false;
+}
+
 void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 {
   if (_config.strategy != request_type::lookahead) { return; }
@@ -556,33 +672,49 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
   if (!submission) { return; }
 
   try {
-    std::lock_guard lock(state->lookahead_mutex);
-    for (; state->index_of_next_lookahead < state->lookahead_queue.size();
-         ++state->index_of_next_lookahead) {
-      auto* node = state->lookahead_queue[state->index_of_next_lookahead];
-      if (node == nullptr) { continue; }
-      auto hint = node->get_next_task_hint();
-      if (!hint.has_value()) {
-        if (!node->get_pipeline()->is_pipeline_finished()) { return; }
+    if (!state->lookahead_progress) return;
+    for (auto index : state->lookahead_progress->eligible()) {
+      auto* node = state->lookahead_queue[index];
+      if (!node || node->get_pipeline()->is_pipeline_finished()) {
+        state->lookahead_progress->finish(index, true);
         continue;
       }
-      if (hint.value().hint == op::TaskCreationHint::READY) {
-        SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
-                         node->get_name(),
-                         node->get_operator_id());
-        const auto [_, priority] = request_keys_for(node);
-        auto request             = std::make_unique<task_creation_request>();
-        request->node            = node;
-        request->type            = request_type::lookahead;
-        request->query_id        = query_id;
-        request->priority        = priority;
-        request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
-        request->operator_type   = node->type;
-        request->work            = submission.take_work_lease();
-        report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
-        ++state->index_of_next_lookahead;
-        return;
+      SIRIUS_LOG_TRACE("Task Creator: considering lookahead operator {}", node->get_operator_id());
+      if (defer_lookahead(node, *state)) continue;
+      auto hint = node->get_next_task_hint();
+      if (!hint || hint->hint != op::TaskCreationHint::READY) continue;
+      if (!state->lookahead_progress->claim(index)) continue;
+      auto progress                 = state->lookahead_progress;
+      auto wake                     = _task_scheduler
+                                        ? std::weak_ptr<exec::wake_event>(_task_scheduler->policy_wakeup())
+                                        : std::weak_ptr<exec::wake_event>{};
+      auto signal                   = wake.lock();
+      auto const claimed_generation = signal ? signal->generation() : 0;
+      // Install claim cleanup before any subsequent allocation/publication can fail.
+      auto release = [progress, index, wake, claimed_generation](bool created) {
+        progress->finish(index, created, wake, claimed_generation);
+      };
+      std::unique_ptr<task_creation_request> request;
+      try {
+        request                   = std::make_unique<task_creation_request>();
+        request->finish_lookahead = release;
+      } catch (...) {
+        release(false);
+        throw;
       }
+      auto const [_, priority] = request_keys_for(node);
+      request->node            = node;
+      request->type            = request_type::lookahead;
+      request->query_id        = query_id;
+      request->priority        = priority;
+      request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
+      request->operator_type   = node->type;
+      request->work            = submission.take_work_lease();
+      SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
+                       node->get_name(),
+                       node->get_operator_id());
+      report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
+      return;
     }
   } catch (...) {
     report_fatal_error(state->completion_handler, std::current_exception());
@@ -656,6 +788,7 @@ void task_creator::manager_loop()
         continue;
       }
       node = next.op;
+      if (request_kind == request_type::lookahead && defer_lookahead(node, *query_state)) continue;
 
       // Keep the physical-input failure fixture's published batch until its held footer fails.
       if (auto completion = query_state->completion_handler;
@@ -696,7 +829,9 @@ void task_creator::manager_loop()
             }
 
             while (!node->all_ports_empty()) {
-              auto task_lock  = pipeline->get_task_creation_lock();
+              auto task_lock = pipeline->get_task_creation_lock();
+              if (request_kind == request_type::lookahead && defer_lookahead(node, *query_state))
+                break;
               auto input_data = node->get_next_task_input_data();
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
@@ -859,7 +994,10 @@ void task_creator::manager_loop()
                 query_id, operator_id, node->type, gpu_pipeline_task_global_state->get_priority());
               _task_scheduler->schedule(std::move(task));
 
-              if (request_kind == request_type::lookahead) { break; }
+              if (request_kind == request_type::lookahead) {
+                request->lookahead_created = true;
+                break;
+              }
             }
             // Unconditional re-evaluation at every creation exit: with the
             // source-exhaustion finish guard, "last task completed at T1,

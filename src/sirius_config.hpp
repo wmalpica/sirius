@@ -441,6 +441,7 @@ class parsed_sirius_config {
   static parsed_sirius_config from_node(const YAML::Node& root,
                                         const std::filesystem::path& source_path = {});
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
+  [[nodiscard]] const creator::task_creator_config& get_task_creator_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;
   [[nodiscard]] sirius_config resolve(

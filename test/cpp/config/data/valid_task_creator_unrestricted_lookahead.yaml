@@ -1,0 +1,5 @@
+sirius:
+  executor:
+    task_creator:
+      strategy: lookahead
+      lookahead_wait_for_dynamic_filters: false

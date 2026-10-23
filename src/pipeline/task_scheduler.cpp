@@ -57,7 +57,8 @@ task_scheduler::task_scheduler(
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
   // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
   // belongs to; see pipeline::index_keys_for.
-  : _task_queue(&index_keys_for),
+  : _task_queue(&index_keys_for, _policy_wakeup),
+    _task_request_channel(_policy_wakeup),
     _task_queue_telemetry(telemetry_context->context().task_queue_observer()->handle()),
     _query_lifecycle(lifecycle),
     _telemetry_context(std::move(telemetry_context))
@@ -187,6 +188,7 @@ void task_scheduler::stop()
   // _task_request_channel.get(), so closing the channel is what wakes it.
   // _task_queue.interrupt() is still useful to reject any concurrent
   // schedule() calls but no longer needed to wake the loop.
+  _policy_wakeup->interrupt();
   _task_queue.interrupt();
   _task_request_channel.close();
   // Join the management thread first so it can finish processing any drained
@@ -263,11 +265,12 @@ void task_scheduler::management_eventloop()
 
   // Each pass tops up the two things the matcher needs — known ready devices
   // and a non-empty queue — sleeping only for whichever is missing. The queue
-  // sleep (not the channel) is what hears the downgrade executor returning
-  // extracted tasks: that return is a direct _task_queue.push() with no
-  // task_available event, and blocking solely on the channel deadlocked once
-  // every executor had parked (#1467). Both sleeps are interrupted by stop().
+  // work signal hears both direct downgrade queue returns and filter-policy
+  // transitions. Blocking solely on the channel misses direct queue returns
+  // (#1467); waiting solely for queue contents misses filter completion.
+  // Both the channel and work-signal waits are interrupted by stop().
   while (_running.load()) {
+    auto const wake_generation = _policy_wakeup->generation();
     // Devices: block only when none is parked (every executor is then busy
     // and will post device_ready), then drain the pending burst.
     auto evt = _task_request_channel.try_get();
@@ -296,9 +299,11 @@ void task_scheduler::management_eventloop()
       if (_task_creator && !_ready_devices.empty()) {
         _task_creator->schedule_lookahead(*_ready_devices.begin());
       }
-      if (!_task_queue.wait()) {
-        SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
-        break;
+      if (_task_queue.empty()) {
+        // Task pushes (including direct downgrade returns), device readiness and
+        // filter completion share this signal. Capture-before-check avoids lost wakes.
+        if (!_policy_wakeup->wait(wake_generation)) break;
+        continue;
       }
     }
 

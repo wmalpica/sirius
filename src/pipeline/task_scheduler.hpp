@@ -196,10 +196,13 @@ class task_scheduler {
   /// Throws on queued execution tasks rather than silently dropping unfinished work.
   void validate_query_complete(sirius::query_id_t query_id);
 
+  std::shared_ptr<exec::wake_event> const& policy_wakeup() const noexcept { return _policy_wakeup; }
+
  private:
   void management_eventloop();
 
   /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
+  std::shared_ptr<exec::wake_event> _policy_wakeup{std::make_shared<exec::wake_event>()};
   exec::multi_index_priority_queue<sirius::parallel::itask> _task_queue;
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
   /// Publisher used by schedule() to wake the management event loop when a new

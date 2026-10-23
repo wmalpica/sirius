@@ -8,10 +8,10 @@ This document covers the task creation subsystem: how the system decides when an
 
 The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
 
-Task creation policy is internal and currently demand-driven, with source-side
-pipelines prioritized first within each branch. The engine retains its
-lookahead and reverse-priority primitives for policy-controlled use, but users
-do not select either through YAML.
+Task creation defaults to demand-driven (`strategy: active`), with source-side pipelines
+prioritized first within each branch. YAML can select `strategy: lookahead` to warm one
+additional scan when execution work runs out. Filter-aware deferral is enabled by default
+for lookahead; pipeline priority direction remains internal and source-first.
 
 ## Core Flow
 
@@ -250,7 +250,46 @@ The `mark_task_created()` call before data popping prevents a race condition whe
 
 **Files:** `src/creator/config.hpp`, `src/creator/task_creator.cpp`
 
-The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds that query's `lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the query's queue, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is released by `reset(query_id)` after the runtime owner retires the query, so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
+The task creator is constructed with a YAML-loadable `task_creator_config`: `strategy: active`
+(the default) or `strategy: lookahead`. Preparation records scan candidates after the first.
+When the scheduler has an available executor and an empty execution queue, it considers the
+oldest accepting query's candidates. One request creates at most one task. Successful warm-ups
+are not repeated; unfinished or filter-deferred candidates remain eligible, and claims prevent
+concurrent duplicate requests. Request destruction releases a claim, including failed creation,
+queue rejection and cancellation. Query reset releases candidate state only after work retires.
+
+With `lookahead_wait_for_dynamic_filters: true` (the default), a scan's bound filter columns
+are checked before nomination, after hint traversal, and before consuming scan input. The scan
+waits until all relevant producers finish, even when a zone map or another producer's membership
+filter is already visible. Producers skipped because of size/coverage/type gates, failures,
+cancellation and abandoned rights all resolve the wait without requiring a filter to exist.
+Ignored columns and closed targets do not keep a scan waiting. Endpoint-only filters without a
+scan binding do not gate a scan.
+
+The creator proves independence using the hash-join build pipeline's upstream sources: all
+must be known scans earlier than the candidate in the query's scan order. Waiting edges can
+therefore never form a cycle. Unknown/manual producers, self-dependencies, cyclic upstream
+walks and later build roots bypass the optional wait. Normal `active` requests always bypass
+it, preserving the original progress path. Set the option false to benchmark unrestricted
+lookahead without changing source-first priority.
+
+The scheduler and filter channels share a generation-counted wake event. Task queue pushes
+(including direct downgrade returns), device-ready events, and filter publication/completion
+notify it. Capturing the generation before inspecting state prevents a completion between
+inspection and sleeping from being lost. Filter channels retain only weak notification
+references, never query work leases or operator pointers. Notifications run no callback and
+cannot re-enter the channel; query teardown needs no observer thread or polling loop.
+
+Trace events name candidates considered, filter deferrals, releases with the observed filter
+count and elapsed wait, dependency bypasses, and requests scheduled. Per-task input preparation
+and filtering still run through normal GPU placement, memory reservations and pipeline execution.
+This feature is separate from disk readahead and `scan_manager.memory_prefetcher`.
+
+For an isolated comparison, keep Bloom caps, pin placement, scan batch sizes and instrumentation
+fixed, and compare `active`, `lookahead` with filter waiting false, and `lookahead` with it true.
+Use Q3/Q7/Q9/Q13/Q21 on the same 1/2/4-GPU configurations; record query times, emitted scan rows,
+spills, GPU idle intervals and filter publication latency. Check results against a CPU reference
+and include multiple independent sessions.
 
 ## Device Assignment for GPU Tasks
 

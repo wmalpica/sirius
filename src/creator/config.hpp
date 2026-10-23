@@ -96,9 +96,12 @@ struct task_creator_config {
   exec::thread_pool_config thread_pool{.num_threads        = default_task_creator_num_threads,
                                        .thread_name_prefix = "task_creator"};
 
-  /// Internal policy for servicing scheduling requests. The current default is active
-  /// (demand-driven only); lookahead remains available to engine-controlled policy.
+  /// YAML-selectable task creation policy. Active remains the demand-driven default.
   request_type strategy{request_type::active};
+
+  /// Defer speculative scans until independently producible scan filters settle.
+  /// Ignored in active mode; false enables unrestricted lookahead for comparisons.
+  bool lookahead_wait_for_dynamic_filters{true};
 
   /// Internal within-branch scheduling priority, consumed by compute_pipeline_priorities.
   /// The current engine policy keeps plan order (head/scan first); sink remains available to a

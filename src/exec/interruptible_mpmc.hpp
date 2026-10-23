@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exec/wake_event.hpp"
+
 #include <blockingconcurrentqueue.h>
 
 #include <atomic>
@@ -56,6 +58,7 @@ class interruptible_mpmc {
 
   // Atomic flag to manage the shutdown state
   std::atomic<bool> _is_active{true};
+  std::shared_ptr<wake_event> _wake;
 
   // Backstop poll interval (us) for wait_dequeue_timed. interrupt() wakes consumers directly, so
   // this only bounds the (not expected) case of a missed sentinel.
@@ -64,7 +67,7 @@ class interruptible_mpmc {
   static constexpr int kWakeSentinels = 4;
 
  public:
-  interruptible_mpmc() = default;
+  explicit interruptible_mpmc(std::shared_ptr<wake_event> wake = {}) : _wake(std::move(wake)) {}
   // Delete copy/move to prevent unsafe duplication of the internal queue
   interruptible_mpmc(const interruptible_mpmc&)            = delete;
   interruptible_mpmc& operator=(const interruptible_mpmc&) = delete;
@@ -80,6 +83,7 @@ class interruptible_mpmc {
   {
     if (!_is_active.load(std::memory_order_relaxed)) { return false; }
     queue.enqueue(std::make_unique<value_type>(std::forward<Args>(args)...));
+    if (_wake) _wake->notify();
     return true;
   }
 
@@ -88,6 +92,7 @@ class interruptible_mpmc {
     assert(item != nullptr);
     if (!_is_active.load(std::memory_order_relaxed)) { return false; }
     queue.enqueue(std::move(item));
+    if (_wake) _wake->notify();
     return true;
   }
 
@@ -137,6 +142,7 @@ class interruptible_mpmc {
   void interrupt()
   {
     _is_active.store(false);
+    if (_wake) _wake->notify();
     for (int i = 0; i < kWakeSentinels; ++i) {
       queue.enqueue(pointer_type{});
     }

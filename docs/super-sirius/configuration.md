@@ -304,12 +304,34 @@ hardware-derived exception described below:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`). Task creation
-policy and within-branch priority are internal: Sirius currently creates tasks
-on demand and prioritizes source-side pipelines first. The former
-`sirius.executor.task_creator.strategy` and
-`sirius.executor.task_creator.priority_order` keys have been removed;
-configurations that still contain either key must delete it.
+Thread pool (default `num_threads: 1`) plus task-creation policy:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `strategy` | `active` | `active` creates tasks on demand. `lookahead` may warm one additional ready scan when the execution queue is empty and an executor is available. |
+| `lookahead_wait_for_dynamic_filters` | `true` | In lookahead mode, defer speculative scans while relevant dynamic-filter producers are pending and their builds are proven independent and earlier in scan order. False enables unrestricted lookahead. Ignored in active mode. |
+
+```yaml
+sirius:
+  executor:
+    task_creator:
+      strategy: lookahead
+      lookahead_wait_for_dynamic_filters: true
+```
+
+A deferred scan remains eligible and does not block unrelated candidates. Publication,
+producer completion without a filter (including a cap refusal), and cancellation wake the
+scheduler without polling. All relevant producers must settle: publishing one filter does
+not release a scan while another relevant producer remains pending. Normal demand-driven
+requests are never delayed by this option. Unknown producer dependencies, self-dependencies,
+and builds rooted in later scans bypass the wait to preserve progress. These safeguards can
+allow a scan to execute before a filter arrives; this is an optional lookahead policy, not a
+hard query dependency. The setting does not enable scan I/O readahead or host-to-GPU memory
+prefetching.
+
+The within-branch priority remains source-first. The former `priority_order` YAML key is
+still rejected. Trace logging reports lookahead candidates, filter deferrals, releases and
+elapsed deferral time, and dependency-proof bypasses.
 
 ### `sirius.executor.pipeline`
 

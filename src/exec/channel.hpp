@@ -78,7 +78,10 @@ class publisher {
 template <smart_pointer T>
 class channel {
  public:
-  channel() : _queue(std::make_shared<interruptible_mpmc<T>>()) {}
+  explicit channel(std::shared_ptr<wake_event> wake = {})
+    : _queue(std::make_shared<interruptible_mpmc<T>>(std::move(wake)))
+  {
+  }
 
   // Non-copyable (only one consumer allowed)
   channel(const channel&)            = delete;

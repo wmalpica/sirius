@@ -483,6 +483,15 @@ struct sirius_dynamic_filter_set::state {
   };
 
   mutable std::mutex mutex;
+  std::vector<std::weak_ptr<exec::wake_event>> wakeups;
+  // Notifications have no callback and never acquire a query/channel lock. The
+  // scheduler does not hold the wake-event mutex while inspecting filter state.
+  void notify() const noexcept
+  {
+    for (auto const& weak : wakeups) {
+      if (auto wake = weak.lock()) wake->notify();
+    }
+  }
   std::unordered_map<std::size_t, column_filters> filters;
   std::unordered_set<std::size_t> ignored_columns;
   std::set<std::size_t> planned_columns;
@@ -541,6 +550,7 @@ bool sirius_dynamic_filter_set::producer::push_filter(
   // Registration reserved this push, so appending does not allocate.
   _channel->filters.find(col_idx)->second.filters.push_back(std::move(filter));
   _channel->filter_count.fetch_add(1, std::memory_order_release);
+  _channel->notify();
   return true;
 }
 
@@ -553,6 +563,7 @@ void sirius_dynamic_filter_set::producer::finish(completion result) const noexce
   slot.result   = result;
   slot.terminal = true;
   ++_channel->completed_producers;
+  _channel->notify();
 }
 //===--------------------------------------------------===//
 
@@ -575,6 +586,7 @@ void sirius_dynamic_filter_set::ignore_columns(std::vector<std::size_t> const& c
 {
   std::scoped_lock lock(_state->mutex);
   _state->ignored_columns.insert(cols.begin(), cols.end());
+  _state->notify();
 }
 
 sirius_dynamic_filter_set::producer sirius_dynamic_filter_set::register_producer(
@@ -614,11 +626,51 @@ void sirius_dynamic_filter_set::freeze_registration() noexcept
 {
   std::scoped_lock lock(_state->mutex);
   _state->registration_frozen = true;
+  _state->notify();
 }
 
 bool sirius_dynamic_filter_set::has_producers() const noexcept
 {
   return _state->producer_count.load(std::memory_order_acquire) != 0;
+}
+
+std::size_t sirius_dynamic_filter_set::num_producers() const noexcept
+{
+  return _state->producer_count.load(std::memory_order_acquire);
+}
+
+void sirius_dynamic_filter_set::observe_wakeup(std::shared_ptr<exec::wake_event> const& wake)
+{
+  if (!wake) return;
+  std::scoped_lock lock(_state->mutex);
+  std::erase_if(_state->wakeups, [](auto const& weak) { return weak.expired(); });
+  for (auto const& weak : _state->wakeups) {
+    if (weak.lock() == wake) return;
+  }
+  _state->wakeups.emplace_back(wake);
+}
+
+sirius_dynamic_filter_set::lookahead_readiness sirius_dynamic_filter_set::readiness_for(
+  std::span<std::size_t const> columns) const
+{
+  std::scoped_lock lock(_state->mutex);
+  lookahead_readiness result;
+  result.registration_frozen = _state->registration_frozen;
+  if (!_state->accepting.load(std::memory_order_relaxed)) return result;
+  auto relevant = [&](std::size_t column) {
+    return !_state->ignored_columns.contains(column) &&
+           std::ranges::find(columns, column) != columns.end();
+  };
+  for (auto const& producer : _state->producers) {
+    if (!std::ranges::any_of(producer.room, [&](auto const& slot) { return relevant(slot.first); }))
+      continue;
+    ++result.relevant_producers;
+    if (!producer.terminal) ++result.pending_producers;
+  }
+  for (auto const& [column, filters] : _state->filters) {
+    if (relevant(column)) result.published_filters += filters.filters.size();
+  }
+  return result;
 }
 
 bool sirius_dynamic_filter_set::has_unscoped_producer() const noexcept
@@ -648,6 +700,7 @@ void sirius_dynamic_filter_set::close_for_new_filters()
 {
   std::scoped_lock lock(_state->mutex);
   _state->accepting.store(false, std::memory_order_release);
+  _state->notify();
 }
 
 cudf::ast::expression const& merge_ast_dynamic_filters_into_tree(

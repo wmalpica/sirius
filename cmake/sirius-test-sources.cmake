@@ -17,6 +17,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
     test/cpp/transparent/test_read_view_scaling.cpp
+    test/cpp/integration/test_lookahead_sql.cpp
     test/cpp/integration/test_transparent_read_view.cpp
     test/cpp/scan/test_split_certificates.cpp
     test/cpp/transparent/test_late_failure.cpp
@@ -29,6 +30,7 @@ set(TEST_SOURCES
     test/cpp/compression/test_compression.cpp
     test/cpp/compression/test_decode_reservation.cpp
     test/cpp/config/test_config.cpp
+    test/cpp/config/test_task_creator_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_scan_manager_config.cpp
@@ -41,6 +43,7 @@ set(TEST_SOURCES
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
+    test/cpp/creator/test_lookahead_policy.cpp
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp

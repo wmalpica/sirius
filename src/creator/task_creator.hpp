@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "creator/lookahead_policy.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "event/query_event_publisher.hpp"
 #include "exec/bounded_thread_pool.hpp"
@@ -40,6 +41,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -86,6 +88,12 @@ struct task_creation_request {
   exec::query_lifecycle_registry::work_lease work;
   op::sirius_physical_operator* node;
   request_type type = request_type::active;
+  bool lookahead_created{false};
+  std::function<void(bool)> finish_lookahead;
+  ~task_creation_request()
+  {
+    if (finish_lookahead) finish_lookahead(lookahead_created);
+  }
   //! The query `node` belongs to. Indexes the request in the creation queue so a finished or
   //! failed query's pending requests can be dropped without touching any other query's.
   sirius::query_id_t query_id = sirius::make_query_id(0);
@@ -380,11 +388,22 @@ class task_creator {
     std::size_t full_gpu_count{0};
 
     std::mutex lookahead_mutex;
-    std::size_t index_of_next_lookahead{0};
     std::vector<op::sirius_physical_operator*> lookahead_queue;
+    std::shared_ptr<lookahead_candidates> lookahead_progress;
+    struct filter_gate {
+      std::shared_ptr<op::sirius_dynamic_filter_set> channel;
+      std::vector<std::size_t> columns;
+      std::size_t known_producers{0};
+      bool independent{true};
+    };
+    // Fixed during preparation. No operator pointers escape through filter notifications.
+    std::unordered_map<op::sirius_physical_operator*, filter_gate> lookahead_filters;
 
     // Creator requests carry work leases through manager processing and worker destruction.
   };
+
+  void prepare_lookahead_filters(const planner::query& query, query_task_global_state& state);
+  bool defer_lookahead(op::sirius_physical_operator* scan, query_task_global_state& state);
 
   //! Resolve a query's state, or nullptr when it has already been reset.
   std::shared_ptr<query_task_global_state> get_query_task_global_state(

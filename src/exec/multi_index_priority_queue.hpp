@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/queue_priority.hpp"
+#include "exec/wake_event.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 
 #include <cassert>
@@ -156,7 +157,9 @@ class multi_index_priority_queue {
 
  public:
   /// @param extractor Computes each task's priority and index keys. Must be valid.
-  explicit multi_index_priority_queue(key_extractor extractor) : _extract(std::move(extractor))
+  explicit multi_index_priority_queue(key_extractor extractor,
+                                      std::shared_ptr<wake_event> wake = {})
+    : _extract(std::move(extractor)), _wake(std::move(wake))
   {
     assert(_extract && "multi_index_priority_queue requires a valid key extractor");
   }
@@ -237,6 +240,7 @@ class multi_index_priority_queue {
       }
     }
     _cv.notify_all();
+    if (_wake) _wake->notify();
     return true;
   }
 
@@ -402,6 +406,7 @@ class multi_index_priority_queue {
       _active = false;
     }
     _cv.notify_all();
+    if (_wake) _wake->notify();
   }
 
   /// Resumes normal blocking behavior after interrupt().
@@ -412,6 +417,7 @@ class multi_index_priority_queue {
       _active = true;
     }
     _cv.notify_all();
+    if (_wake) _wake->notify();
   }
 
   /// Detach under the mutex; destructors can publish callbacks or release query leases.
@@ -698,6 +704,7 @@ class multi_index_priority_queue {
   device_index_map _by_device;  ///< device -> prio -> tasks.
   key_extractor _extract;
   std::size_t _size{0};
+  std::shared_ptr<wake_event> _wake;
 };
 
 }  // namespace sirius::exec

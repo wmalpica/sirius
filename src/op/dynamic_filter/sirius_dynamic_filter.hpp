@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/wake_event.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
@@ -610,6 +611,20 @@ class sirius_dynamic_filter_set {
   void freeze_registration() noexcept;
 
   [[nodiscard]] bool has_producers() const noexcept;
+
+  struct lookahead_readiness {
+    bool registration_frozen{false};
+    std::size_t relevant_producers{0};
+    std::size_t pending_producers{0};
+    std::size_t published_filters{0};
+  };
+  /// Allocation-free observation for the scan's bound endpoint columns. All
+  /// relevant producers must settle, even if one has already published a filter.
+  [[nodiscard]] lookahead_readiness readiness_for(std::span<std::size_t const> columns) const;
+  [[nodiscard]] std::size_t num_producers() const noexcept;
+  /// Weak, notification-only subscription: retains neither the scheduler nor query work.
+  /// Register before observing readiness, so completion before a wait cannot be lost.
+  void observe_wakeup(std::shared_ptr<exec::wake_event> const& wake);
 
   /**
    * @brief Get sorted consumer-output ordinals.
