@@ -17,6 +17,7 @@
 #include "data/data_batch_utils.hpp"
 
 #include "compression/simpatico_compressed_representation.hpp"
+#include "cudf/cudf_utils.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -67,6 +68,26 @@ batch_rows_and_bytes get_batch_rows_and_bytes(cucascade::data_batch const& batch
   if (data == nullptr) { return {}; }
   return {.rows  = representation_num_rows(*data),
           .bytes = data->get_uncompressed_data_size_in_bytes()};
+}
+
+std::shared_ptr<cucascade::data_batch> make_empty_gpu_data_batch(
+  duckdb::vector<logical_type> const& types,
+  cucascade::memory::memory_space& memory_space,
+  ::cuda::stream_ref writer_stream,
+  telemetry::batch_telemetry_info const& telemetry_info)
+{
+  validate_gpu_batch_memory_space(memory_space);
+  return make_data_batch(make_empty_table(types), memory_space, writer_stream, telemetry_info);
+}
+
+std::shared_ptr<cucascade::data_batch> make_empty_gpu_data_batch(
+  std::vector<cudf::data_type> const& types,
+  cucascade::memory::memory_space& memory_space,
+  ::cuda::stream_ref writer_stream,
+  telemetry::batch_telemetry_info const& telemetry_info)
+{
+  validate_gpu_batch_memory_space(memory_space);
+  return make_data_batch(make_empty_table(types), memory_space, writer_stream, telemetry_info);
 }
 
 }  // namespace sirius

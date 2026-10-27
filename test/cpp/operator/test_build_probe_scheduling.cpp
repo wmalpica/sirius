@@ -34,12 +34,17 @@
 #include "operator_test_utils.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "utils/sirius_test_env.hpp"
+
+#include <rmm/cuda_stream.hpp>
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/null_device_memory_resource.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -816,7 +821,153 @@ nomination_fixture make_join(duckdb::JoinType join_type)
   return f;
 }
 
+void connect_finished_inputs(sirius::op::sirius_physical_hash_join& join,
+                             cucascade::shared_data_repository& build,
+                             cucascade::shared_data_repository& probe)
+{
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  for (auto [name, repo] : {std::pair{"build", &build}, std::pair{"default", &probe}}) {
+    auto pipeline      = std::make_shared<finishable_pipeline>(ctx);
+    pipeline->finished = true;
+    auto port          = std::make_unique<sirius::op::sirius_physical_operator::port>();
+    port->repo         = repo;
+    port->src_pipeline = std::move(pipeline);
+    join.add_port(name, std::move(port));
+  }
+}
+
+// No CUDA allocations: tests can exercise pre-preparation task creation on a CPU-only host.
+cucascade::memory::host_memory_space_config host_space_config(int numa_id)
+{
+  return {.numa_id = numa_id, .initial_number_pools = 0, .mr_factory_fn = [](int, std::size_t) {
+            return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+              cucascade::memory::null_device_memory_resource{}};
+          }};
+}
+
 }  // namespace
+
+TEST_CASE("GPU batch helpers reject HOST spaces including nonnegative NUMA IDs",
+          "[gpu_batch_memory_space][unit]")
+{
+  cucascade::memory::memory_space host(host_space_config(GENERATE(-1, 0)));
+  ::cuda::stream_ref stream{cudaStream_t{nullptr}};
+  auto const message = Catch::Matchers::ContainsSubstring("requires a GPU memory space");
+  REQUIRE_THROWS_WITH(sirius::make_data_batch(std::make_unique<cudf::table>(), host, stream, {}),
+                      message);
+  cudf::table table;
+  REQUIRE_THROWS_WITH(sirius::make_data_batch(std::move(table), host, stream, {}), message);
+  REQUIRE_THROWS_WITH(sirius::make_data_batch_from_view(
+                        cudf::table_view{}, std::shared_ptr<void>{}, 0, host, stream, {}),
+                      message);
+  REQUIRE_THROWS_WITH(
+    sirius::make_empty_gpu_data_batch(std::vector<cudf::data_type>{}, host, stream, {}), message);
+  REQUIRE_THROWS_WITH(
+    sirius::make_empty_gpu_data_batch(duckdb::vector<sirius::logical_type>{}, host, stream, {}),
+    message);
+}
+
+TEST_CASE("hash join claims HOST orphans without creating GPU data during task creation",
+          "[hash_join][cross_schedule][gpu_batch_memory_space][unit]")
+{
+  auto const present_is_build = GENERATE(false, true);
+  cucascade::memory::memory_space host(host_space_config(-1));
+  auto table    = cucascade::memory::host_table_allocation::create({}, {}, 0);
+  auto survivor = cucascade::data_batch::make(
+    sirius::get_next_batch_id(),
+    std::make_unique<cucascade::host_data_representation>(std::move(table), &host));
+  auto f = make_join(duckdb::JoinType::OUTER);
+  f.hash_join->set_placement(
+    std::make_shared<partition_placement const>(partition_placement::one_per_device({3, 7})));
+  cucascade::shared_data_repository build, probe;
+  build.set_num_partitions(2);
+  probe.set_num_partitions(2);
+  (present_is_build ? build : probe).add_data_batch(survivor, 1);
+  connect_finished_inputs(*f.hash_join, build, probe);
+
+  auto task = f.hash_join->get_next_task_input_data();
+  REQUIRE(task);
+  auto* input = dynamic_cast<sirius::op::partitioned_operator_data*>(task.get());
+  REQUIRE(input);
+  REQUIRE(input->get_data_batches() == std::vector{survivor});
+  CHECK(input->get_partition_idx() == std::optional<std::size_t>{1});
+  CHECK(input->get_preferred_device_id() == std::optional<int>{7});
+  CHECK(survivor->to_read_only().get_memory_space() == &host);
+  CHECK(build.total_size() == 0);
+  CHECK(probe.total_size() == 0);
+
+  // Late materialization must not erase the missing-side metadata or the partition placement.
+  auto replacement = input->with_batches_preserving_rows({survivor});
+  CHECK(typeid(*replacement) == typeid(*input));
+  CHECK(replacement->original_batch_ids() == input->original_batch_ids());
+  CHECK(replacement->get_preferred_device_id() == input->get_preferred_device_id());
+  auto const* partitioned = dynamic_cast<sirius::op::partitioned_operator_data*>(replacement.get());
+  REQUIRE(partitioned);
+  CHECK(partitioned->get_partition_idx() == input->get_partition_idx());
+  CHECK_FALSE(f.hash_join->get_next_task_hint().has_value());
+}
+
+TEST_CASE("FULL OUTER hash join restores spilled orphans before creating the empty side",
+          "[hash_join][cross_schedule][gpu_batch_memory_space][gpu]")
+{
+  if (!sirius::test::has_gpus(1)) { return; }
+  auto const present_is_build = GENERATE(false, true);
+  auto const physical_schema  = GENERATE(false, true);
+  auto manager                = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu                   = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  cucascade::memory::host_memory_space_config config;
+  config.numa_id              = -1;
+  config.memory_capacity      = 16ULL << 20;
+  config.pool_size            = 4;
+  config.initial_number_pools = 0;
+  cucascade::memory::memory_space host(config);
+  rmm::cuda_stream stream;
+  auto survivor = sirius::test::operator_utils::make_numeric_batch<int32_t>(
+    *gpu, {2, 5, 8}, cudf::type_id::INT32);
+  {
+    auto mut = survivor->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), &host, stream);
+  }
+  REQUIRE(survivor->to_read_only().get_memory_space() == &host);
+  auto f = make_join(duckdb::JoinType::OUTER);
+  f.hash_join->set_placement(std::make_shared<partition_placement const>(
+    partition_placement::one_per_device({gpu->get_device_id()})));
+  // Exercise the carrier-exact empty schema rather than reconstructing native INT32 columns.
+  if (physical_schema) {
+    f.hash_join->children[present_is_build ? 0 : 1]->set_physical_types(
+      {cudf::data_type{cudf::type_id::INT16}});
+  }
+  cucascade::shared_data_repository build, probe;
+  (present_is_build ? build : probe).add_data_batch(survivor);
+  connect_finished_inputs(*f.hash_join, build, probe);
+  auto task = f.hash_join->get_next_task_input_data();
+  REQUIRE(task);
+  // Also exercise the dynamic-type-preserving path used by deferred input materialization.
+  task = dynamic_cast<sirius::op::pipelineable_operator_data&>(*task).with_batches_preserving_rows(
+    {survivor});
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    // Reuse the same task input as an OOM retry would: the synthetic side must stay local to
+    // execute.
+    task->prepare_for_processing(gpu, stream);
+    auto output = f.hash_join->execute(*task, stream);
+    stream.synchronize();
+    auto& result = dynamic_cast<sirius::op::pipelineable_operator_data&>(*output);
+    auto batches = result.get_read_only_batches();
+    REQUIRE(batches.size() == 1);
+    CHECK(batches[0].get_memory_space() == gpu);
+    auto view = sirius::get_cudf_table_view(batches[0]);
+    REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.num_rows() == 3);
+    auto values = sirius::test::operator_utils::copy_column_to_host<int32_t>(
+      view.column(present_is_build ? 1 : 0));
+    std::ranges::sort(values);
+    CHECK(values == std::vector<int32_t>{2, 5, 8});
+    CHECK(view.column(present_is_build ? 0 : 1).null_count() == 3);
+    CHECK(view.column(present_is_build ? 0 : 1).type() ==
+          cudf::data_type{physical_schema ? cudf::type_id::INT16 : cudf::type_id::INT32});
+  }
+}
 
 TEST_CASE("primary_input_port - probe-streaming joins nominate the probe side",
           "[hash_join][size_estimation][unit]")

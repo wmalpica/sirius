@@ -17,6 +17,7 @@
 #pragma once
 
 #include "compression/simpatico_compressed_representation.hpp"
+#include "helper/logical_type.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
@@ -28,12 +29,14 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
+#include <duckdb/common/vector.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius {
@@ -171,6 +174,16 @@ inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
   return data->cast<cucascade::gpu_table_representation>().get_table_view();
 }
 
+/// GPU batch constructors must not interpret HOST NUMA IDs as CUDA device IDs.
+inline void validate_gpu_batch_memory_space(cucascade::memory::memory_space const& memory_space)
+{
+  if (memory_space.get_tier() != cucascade::memory::Tier::GPU || memory_space.get_device_id() < 0) {
+    throw std::invalid_argument(
+      "GPU data batch requires a GPU memory space with a nonnegative "
+      "device ID");
+  }
+}
+
 /**
  * @brief Create a shared_ptr<data_batch> from a cudf::table, recording the writer event.
  *
@@ -199,6 +212,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
+  validate_gpu_batch_memory_space(memory_space);
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
   if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
@@ -222,6 +236,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
+  validate_gpu_batch_memory_space(memory_space);
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
   if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
@@ -266,6 +281,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
   ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
+  validate_gpu_batch_memory_space(memory_space);
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
   if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
@@ -275,5 +291,20 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
     std::move(gpu_repr),
     telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
 }
+
+/// Create a schema-correct zero-row batch on the task's prepared GPU space and writer stream.
+/// Rejects HOST/DISK spaces; placement must be resolved by the caller before construction.
+[[nodiscard]] std::shared_ptr<cucascade::data_batch> make_empty_gpu_data_batch(
+  duckdb::vector<logical_type> const& types,
+  cucascade::memory::memory_space& memory_space,
+  ::cuda::stream_ref writer_stream,
+  telemetry::batch_telemetry_info const& telemetry_info);
+
+/// Carrier-exact overload for an operator's physical schema; nested types need the logical schema.
+[[nodiscard]] std::shared_ptr<cucascade::data_batch> make_empty_gpu_data_batch(
+  std::vector<cudf::data_type> const& types,
+  cucascade::memory::memory_space& memory_space,
+  ::cuda::stream_ref writer_stream,
+  telemetry::batch_telemetry_info const& telemetry_info);
 
 }  // namespace sirius

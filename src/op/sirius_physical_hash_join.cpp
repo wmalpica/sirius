@@ -74,6 +74,39 @@
 namespace sirius {
 namespace op {
 
+namespace {
+
+/// A terminal task with no batches on the opposite side. Only the survivor participates in
+/// preparation; execute() synthesizes its counterpart after the survivor has been restored.
+class hash_join_orphan_data : public partitioned_operator_data {
+ public:
+  hash_join_orphan_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                        bool present_is_build,
+                        std::size_t partition,
+                        partition_placement const& placement)
+    : partitioned_operator_data(std::move(batches), partition, placement),
+      present_is_build(present_is_build)
+  {
+  }
+
+  hash_join_orphan_data(std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+                        hash_join_orphan_data const& source)
+    : partitioned_operator_data(std::move(batches)), present_is_build(source.present_is_build)
+  {
+    adopt_partition_identity(source);
+  }
+
+  std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
+  {
+    return std::make_unique<hash_join_orphan_data>(std::move(batches), *this);
+  }
+
+  bool const present_is_build;
+};
+
+}  // namespace
+
 static void collect_reference_indices(sirius::ast::node const& expr,
                                       std::unordered_set<std::size_t>& indices)
 {
@@ -1387,10 +1420,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
 
   // No normal pair. If both producers finished, a partition may have batches on one side and an
   // empty opposite side (e.g. a join against an empty table): those survivors are never paired.
-  // Emit each survivor as an ordinary two-batch task by SYNTHESIZING the empty opposite batch here,
-  // so execute() runs the normal join dispatch unchanged — cuDF NULL-pads the survivor for LEFT /
-  // RIGHT / OUTER / ANTI and yields zero rows for INNER / SEMI. Popping the survivor also drains
-  // the repo so the pipeline can complete.
+  // Carry only the survivor into preparation: it may have spilled to HOST/DISK while waiting.
+  // execute() creates the empty opposite batch on the prepared task's GPU and stream. Popping the
+  // survivor also drains the repo so the pipeline can complete.
   auto const orphan = next_cross_schedule_orphan(_cross, finished.first, finished.second);
   if (orphan.found) {
     auto* present_port = orphan.present_is_build ? build_port : probe_port;
@@ -1398,51 +1430,19 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       present_port->repo->pop_data_batch_by_id(orphan.batch_id, orphan.partition);
     if (!present_batch) { return nullptr; }  // already drained by a concurrent caller
 
-    // Synthesize the empty opposite side from the absent child's output schema (children[0] =
-    // probe/left, children[1] = build/right), on the surviving batch's device. The absent child's
-    // physical sidecar, when it has one, is the carrier schema its batches would have arrived with,
-    // so synthesizing from it keeps every output batch of this join agreeing with the carriers the
-    // join's own sidecar advertises for that side. The batch's memory space is only reachable
-    // through a read-only accessor; take one transiently (shared lock) and release it before
-    // handing the idle batch to the task.
-    cucascade::memory::memory_space* ms = nullptr;
-    {
+    // Count a probe survivor before it leaves the repository; execution retries deduplicate by ID.
+    if (!orphan.present_is_build) {
       auto present_ro = present_batch->to_read_only();
-      ms              = present_ro.get_memory_space();
-      // An orphaned probe has no later retry, so count it through this blocking accessor.
-      if (!orphan.present_is_build) {
-        if (auto const* data = present_ro.get_data(); data != nullptr) {
-          note_probe_bytes_counted(present_batch->get_batch_id(),
-                                   data->get_uncompressed_data_size_in_bytes());
-        }
+      if (auto const* data = present_ro.get_data(); data != nullptr) {
+        note_probe_bytes_counted(present_batch->get_batch_id(),
+                                 data->get_uncompressed_data_size_in_bytes());
       }
     }
-    if (!ms) {
-      throw std::runtime_error(
-        "In sirius_physical_hash_join:get_next_task_input_data: surviving orphan batch has no "
-        "memory space in operator " +
-        std::to_string(this->get_operator_id()));
-    }
-    auto const& absent = orphan.present_is_build ? *children[0]   // absent probe
-                                                 : *children[1];  // absent build
-    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
-    auto empty_table = absent.has_physical_overrides()
-                         ? sirius::make_empty_table(absent.get_physical_types())
-                         : sirius::make_empty_table(absent.get_types());
-    auto empty_batch =
-      make_data_batch(std::move(empty_table), *ms, cudf::get_default_stream(), batch_telemetry());
-
-    std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    input_batch.reserve(2);
-    if (orphan.present_is_build) {
-      input_batch.push_back(std::move(empty_batch));    // [0] = empty probe / "default" / left
-      input_batch.push_back(std::move(present_batch));  // [1] = build / "build" / right
-    } else {
-      input_batch.push_back(std::move(present_batch));  // [0] = probe / "default" / left
-      input_batch.push_back(std::move(empty_batch));    // [1] = empty build / "build" / right
-    }
-    return std::make_unique<partitioned_operator_data>(
-      std::move(input_batch), orphan.partition, *this->placement());
+    return std::make_unique<hash_join_orphan_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(present_batch)},
+      orphan.present_is_build,
+      orphan.partition,
+      *this->placement());
   }
 
   return nullptr;
@@ -1806,8 +1806,24 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                                   ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  // Keep the synthetic batch alive until the local read-only accessors have been released.
+  std::shared_ptr<cucascade::data_batch> empty_batch;
+  auto input_batches = input.get_read_only_batches();
+  if (auto const* orphan = dynamic_cast<hash_join_orphan_data const*>(&input_data)) {
+    if (input_batches.size() != 1) {
+      throw std::runtime_error("Hash join orphan task requires exactly one surviving batch");
+    }
+    auto* space = input_batches.front().get_memory_space();
+    if (!space) { throw std::runtime_error("Hash join orphan task has no prepared GPU space"); }
+    auto const& absent = *children[orphan->present_is_build ? 0 : 1];
+    empty_batch =
+      absent.has_physical_overrides()
+        ? make_empty_gpu_data_batch(absent.get_physical_types(), *space, stream, batch_telemetry())
+        : make_empty_gpu_data_batch(absent.get_types(), *space, stream, batch_telemetry());
+    auto const position = orphan->present_is_build ? input_batches.begin() : input_batches.end();
+    input_batches.insert(position, empty_batch->to_read_only());
+  }
 
   if (is_all_inequality_join) {
     throw std::runtime_error(
@@ -1815,9 +1831,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       duckdb::JoinTypeToString(join_type));
   }
 
-  // The empty-build latch can flip after a STANDARD orphan task (probe + synthesized empty build)
-  // was issued but before it runs: the hint reads the build pipeline's state twice. Such a task
-  // takes the normal dispatch below, whose empty build also yields definite FALSE marks.
+  // The empty-build latch can flip after a STANDARD orphan task was issued but before it runs:
+  // the hint reads the build pipeline's state twice. Its empty build, synthesized above, takes
+  // the normal dispatch below and also yields definite FALSE marks.
   if (_mark_build_empty.load(std::memory_order_acquire) && input_batches.size() == 1) {
     // No build row can make a comparison TRUE or UNKNOWN, even for a NULL probe key. Avoid
     // preparing keys or applying the normal probe-key null mask: every mark is valid FALSE.

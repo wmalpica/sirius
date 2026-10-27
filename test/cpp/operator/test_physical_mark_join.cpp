@@ -478,8 +478,8 @@ TEST_CASE("MARK join drains probe batches when its build pipeline emits no batch
 
 // get_next_task_hint reads the build pipeline's state twice: the empty-build latch can see it
 // unfinished, then refresh_cross_schedule sees it finished and issues a STANDARD orphan task
-// (probe + synthesized empty build). A later hint latches the empty build before that task runs;
-// the queued task must still produce definite FALSE marks rather than fail the query.
+// carrying the probe and a deferred empty build. A later hint latches the empty build before it
+// runs; the queued task must still produce definite FALSE marks rather than fail the query.
 TEST_CASE("MARK join runs an orphan task issued before the empty-build latch",
           "[physical_mark_join][cross_schedule]")
 {
@@ -523,18 +523,19 @@ TEST_CASE("MARK join runs an orphan task issued before the empty-build latch",
   REQUIRE(hint->producer == f.hash_join->children[1].get());
 
   // The build finishes empty between the latch check and the cross schedule: the issued task is a
-  // STANDARD orphan carrying a synthesized empty build batch.
+  // STANDARD orphan carrying only the probe; execution synthesizes the empty build after preparing.
   build_pipeline->finished = true;
   auto orphan              = f.hash_join->get_next_task_input_data();
   REQUIRE(orphan != nullptr);
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*orphan).get_data_batches().size() == 2);
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*orphan).get_data_batches().size() == 1);
 
   // The next hint latches the empty build while the orphan task is still queued.
   hint = f.hash_join->get_next_task_hint();
   REQUIRE(hint.has_value());
   REQUIRE(hint->hint == TaskCreationHint::READY);
 
-  auto mark_of = [&](operator_data const& input) {
+  auto mark_of = [&](operator_data& input) {
+    input.prepare_for_processing(space, cudf::get_default_stream());
     auto output = f.hash_join->execute(input, cudf::get_default_stream());
     auto view   = sirius::get_cudf_table_view(
       *dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches()[0]);
