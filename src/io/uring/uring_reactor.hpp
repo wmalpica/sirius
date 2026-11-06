@@ -244,6 +244,7 @@ class uring_reactor {
 
  private:
   void worker_loop(const std::stop_token& stop_token);
+  void trace_dequeue(grouped_io_request const& request, bool canceled = false) noexcept;
 
   // Shared services + tunables for the whole reactor pool, kept alive for this
   // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
@@ -261,6 +262,10 @@ class uring_reactor {
   std::jthread _worker;
   duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<grouped_io_request>> _requests;
   mutable std::mutex _enqueue_mutex;
+  // Diagnostic order counters. Enqueue is protected by _enqueue_mutex;
+  // dequeue has one consumer (worker, or shutdown after the worker exits).
+  uint64_t _enqueue_sequence{0};
+  uint64_t _dequeue_sequence{0};
   std::atomic<std::size_t> _queued_bytes{0};
   std::atomic<bool> _accepting{false};
 };

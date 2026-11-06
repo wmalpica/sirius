@@ -1,3 +1,4 @@
+#include "log/preparation_timeline.hpp"
 /*
  * Copyright 2025, Sirius Contributors.
  *
@@ -14,8 +15,6 @@
  * limitations under the License.
  */
 
-#include "pipeline/gpu_pipeline_executor.hpp"
-
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda/device_health.hpp"
@@ -25,6 +24,7 @@
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
@@ -73,6 +73,10 @@ sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_i
           thread_prefix     = _config.thread_name_prefix,
           thread_id_counter]() mutable noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
+
+    // Join reactor submitting TIDs to the same GPU/executor names used by Quent.
+    // Emitted once per worker, not per request or polling iteration.
+    diagnostics::timeline::record("uring_executor", 0, nullptr, device_id, thread_id);
 
     try {
       auto& thread_handle = telemetry::executor_thread_telemetry_state.handle;
@@ -138,6 +142,8 @@ void gpu_pipeline_executor::manager_loop()
         break;
       }
       pipeline_task = _task_queue.pop();  // block till a task is available
+      diagnostics::timeline::record(
+        "executor_dequeue", 0, pipeline_task.get(), _memory_space->get_device_id());
     }
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping publisher loop");
@@ -424,6 +430,10 @@ void gpu_pipeline_executor::process_task(
        consumers  = std::move(output_consumers),
        completion = std::move(completion),
        pipeline]() mutable {
+        diagnostics::timeline::span execution("executor_worker",
+                                              task.get(),
+                                              sirius::value_of(query_id),
+                                              _memory_space->get_device_id());
         // The enclosing leased callable retains all captures through this error boundary.
         try {
           try {

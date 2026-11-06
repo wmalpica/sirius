@@ -1,3 +1,4 @@
+#include "log/preparation_probe.hpp"
 #include "op/scan/materialization_contract.hpp"
 /*
  * Copyright 2026, Sirius Contributors.
@@ -670,11 +671,13 @@ class parquet_batch_coalescer : public batch_coalescer {
  private:
   std::unique_ptr<scan_info> emit_current()
   {
+    diagnostics::preparation_probe probe("parquet_emit", this);
     auto reader_options = _run_reader_options ? _run_reader_options : _reader_options;
     auto per_slice_ranges =
       _read_mode == parquet_read_mode::METADATA_ONLY
         ? std::vector<std::vector<cudf::io::text::byte_range_info>>(_slices.size())
         : slice_column_chunk_ranges(_slices, reader_options, _ranges_cache);
+    probe.mark("ranges");
     auto hints            = parquet_fadvise_entries(_slices, per_slice_ranges);
     auto split            = std::make_unique<parquet_split_info>(std::move(hints));
     split->rg_slices      = std::move(_slices);
@@ -1218,6 +1221,8 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
   std::shared_ptr<io::ioctx> const& io_ctx,
   std::stop_token stop)
 {
+  diagnostics::timeline::span file_span(
+    "file_scan_info", this, file_index, diagnostics::timeline::label(file_path));
   if (stop.stop_requested())
     throw std::system_error(std::make_error_code(std::errc::operation_canceled));
   if (_execution_completion && _execution_completion->injections &&
@@ -1638,7 +1643,9 @@ std::unique_ptr<scan_info> parquet_scan_core::build_file_scan_info(
     if (ast_expression) { opts.set_filter(ast_expression->back()); }
   }
 
+  diagnostics::timeline::record("scan_reader_begin", file_span.id, &metadata);
   hybrid_scan_reader reader(metadata, opts);
+  diagnostics::timeline::record("scan_reader_end", file_span.id, &metadata);
 
   // Per-file leaf-column selection for byte accounting. Pure-filter columns are
   // part of the decode working set but not the projected-column estimate.

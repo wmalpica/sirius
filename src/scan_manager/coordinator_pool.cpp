@@ -16,6 +16,8 @@
 
 #include "scan_manager/coordinator_pool.hpp"
 
+#include "log/preparation_timeline.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <condition_variable>
@@ -48,6 +50,7 @@ struct coordinator_pool::state {
     if (index >= entries.size()) return;
     auto const& e = entries[index];
     if (!e || e->generation != generation || e->finished) return;
+    diagnostics::timeline::record("control_wake", generation, e.get(), e->executing, e->runnable);
     e->runnable = true;
     e->deadline.reset();
     changed.notify_all();
@@ -93,7 +96,13 @@ struct coordinator_pool::state {
       }
       step_result result{progress::runnable};
       try {
+        diagnostics::timeline::span trace(
+          "control_pool_step", selected.get(), selected->generation);
         result = selected->step();
+        diagnostics::timeline::record("control_pool_result",
+                                      selected->generation,
+                                      selected.get(),
+                                      static_cast<uint64_t>(result.next));
       } catch (...) {
         // Failure belongs to this attempt. Its next step must still retire owned work.
         selected->fail(std::current_exception());

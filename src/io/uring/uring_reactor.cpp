@@ -15,6 +15,7 @@
  */
 
 #include "io/uring/uring_reactor.hpp"
+#include "log/preparation_timeline.hpp"
 
 #include "cucascade/cuda/event.hpp"
 #include "exec/thread_util.hpp"
@@ -524,6 +525,7 @@ void uring_reactor::shutdown()
   std::unique_ptr<grouped_io_request> request;
   while (_requests.try_dequeue(request)) {
     if (request == nullptr) continue;
+    trace_dequeue(*request, true);
     _queued_bytes.fetch_sub(request->remaining_bytes(), std::memory_order_relaxed);
     request->cancel_remaining(canceled_error());
   }
@@ -540,6 +542,21 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
   {
     std::lock_guard lock(_enqueue_mutex);
     if (_accepting.load(std::memory_order_acquire)) {
+      auto const tracing = diagnostics::timeline::path() != nullptr;
+      auto const sequence = tracing ? ++_enqueue_sequence : 0;
+      if (tracing) {
+        request->queue_trace_sequence = sequence;
+        request->queue_trace_parent = diagnostics::timeline::context;
+        // Warm up the per-thread recorder before starting the queue-age clock.
+        // This event also carries the target GPU (+1; zero means host-only)
+        // and number of slices, without making any CUDA calls on this path.
+        auto const device = request->empty() ? -1 : request->front().d_buffer.device_id;
+        diagnostics::timeline::record("uring_request_shape", sequence, this,
+                                      static_cast<uint64_t>(device + 1),
+                                      request->remaining_slices());
+        request->queue_trace_enqueued_ns = diagnostics::timeline::now();
+        diagnostics::timeline::record("uring_enqueue", sequence, this, sequence, bytes);
+      }
       _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
       try {
         enqueued = _requests.enqueue(std::move(request));
@@ -549,11 +566,23 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
         error    = std::current_exception();
       }
       if (!enqueued) { _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed); }
+      if (tracing && !enqueued) {
+        diagnostics::timeline::record("uring_enqueue_failed", sequence, this);
+      }
     }
   }
   // Cancellation runs outside the lock: it invokes user callbacks and settles
   // promises inline, which may re-enter enqueue() on this reactor.
   if (!enqueued && request != nullptr) { request->cancel_remaining(error); }
+}
+
+void uring_reactor::trace_dequeue(grouped_io_request const& request, bool canceled) noexcept
+{
+  if (request.queue_trace_sequence == 0) return;
+  auto const age = diagnostics::timeline::now() - request.queue_trace_enqueued_ns;
+  diagnostics::timeline::record(canceled ? "uring_cancel_dequeue" : "uring_dequeue",
+                                request.queue_trace_sequence, this,
+                                ++_dequeue_sequence, age, request.queue_trace_parent);
 }
 
 bool uring_reactor::supports(std::string_view path)
@@ -709,6 +738,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     std::unique_ptr<grouped_io_request> request;
     while (_requests.try_dequeue(request)) {
       if (request == nullptr) continue;
+      trace_dequeue(*request, true);
       auto const bytes = request->remaining_bytes();
       _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
       request->cancel_remaining(error);
@@ -1070,6 +1100,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           std::unique_ptr<grouped_io_request> next;
           if (_requests.try_dequeue(next)) {
             if (next == nullptr) break;
+            trace_dequeue(*next);
             active = std::move(next);
             continue;
           }
@@ -1097,6 +1128,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           std::unique_ptr<grouped_io_request> next;
           if (!_requests.wait_dequeue_timed(next, POLL_INTERVAL_US)) continue;
           if (next == nullptr) break;
+          trace_dequeue(*next);
           active = std::move(next);
         }
       }

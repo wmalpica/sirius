@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
+#include "log/preparation_timeline.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -115,6 +116,7 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
   // Declared before task so an exception destroys unsubmitted work before settling its publisher.
   exec::query_lifecycle_registry::submission_guard submission;
   auto task = std::move(input);
+  diagnostics::timeline::record("scheduler_enqueue", 0, task.get());
   try {
     // Refuse work for a query that is tearing down. A task creation worker can land here after
     // that query's queue drain already ran, and the task would then sit in the shared queue holding
@@ -363,6 +365,7 @@ void task_scheduler::management_eventloop()
         // // load-bearing — verification greps depend on it.
         // SIRIUS_LOG_INFO(
         //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+        diagnostics::timeline::record("scheduler_dispatch", 0, task.get(), device_id);
         if (_gpu_executors.at(device_id)->schedule(std::move(task))) {
           it = _ready_devices.erase(it);
         }

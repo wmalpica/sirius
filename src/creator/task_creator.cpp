@@ -18,6 +18,7 @@
 
 #include "exec/leased_callable.hpp"
 #include "log/logging.hpp"
+#include "log/preparation_probe.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -438,11 +439,17 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   auto submission = begin_submission(query_id);
   if (!submission) { return; }
   auto request           = std::make_unique<task_creation_request>();
+  request->trace_id      = diagnostics::timeline::next_id();
   request->node          = node;
   request->query_id      = query_id;
   request->priority      = priority;
   request->operator_type = node->type;
   request->work          = submission.take_work_lease();
+  diagnostics::timeline::record("creator_request",
+                                request->trace_id,
+                                node,
+                                sirius::value_of(query_id),
+                                static_cast<uint64_t>(request->type));
   report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
 }
 
@@ -452,11 +459,17 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   if (!submission) { return; }
   const auto [_, priority] = request_keys_for(node);
   auto request             = std::make_unique<task_creation_request>();
+  request->trace_id        = diagnostics::timeline::next_id();
   request->node            = node;
   request->query_id        = query_id;
   request->priority        = priority;
   request->operator_type   = node->type;
   request->work            = submission.take_work_lease();
+  diagnostics::timeline::record("creator_request",
+                                request->trace_id,
+                                node,
+                                sirius::value_of(query_id),
+                                static_cast<uint64_t>(request->type));
   report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
 }
 
@@ -572,6 +585,7 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
                          node->get_operator_id());
         const auto [_, priority] = request_keys_for(node);
         auto request             = std::make_unique<task_creation_request>();
+        request->trace_id        = diagnostics::timeline::next_id();
         request->node            = node;
         request->type            = request_type::lookahead;
         request->query_id        = query_id;
@@ -579,6 +593,11 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
         request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
         request->operator_type   = node->type;
         request->work            = submission.take_work_lease();
+        diagnostics::timeline::record("creator_request",
+                                      request->trace_id,
+                                      node,
+                                      sirius::value_of(query_id),
+                                      static_cast<uint64_t>(request->type));
         report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
         ++state->index_of_next_lookahead;
         return;
@@ -592,7 +611,9 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 void task_creator::manager_loop()
 {
   while (_running.load()) {
+    diagnostics::timeline::span reserve_span("creator_reserve", this);
     auto slot = _bounded_pool->reserve();  // block till a thread is available
+    diagnostics::timeline::record("creator_slot_ready", reserve_span.id, this);
     if (!slot) {
       SIRIUS_LOG_INFO("Task Creator: pool interrupted, stopping publisher loop");
       break;
@@ -603,6 +624,8 @@ void task_creator::manager_loop()
       continue;
     }
 
+    diagnostics::timeline::record(
+      "creator_dequeue", request->trace_id, request->node, sirius::value_of(request->query_id));
     auto node           = request->node;
     auto request_kind   = request->type;
     const auto query_id = request->query_id;
@@ -626,6 +649,8 @@ void task_creator::manager_loop()
       auto* requested_node = node;
       auto const next      = get_operator_for_next_task(node, visited_pipelines);
 
+      diagnostics::timeline::record(
+        "creator_readiness", request->trace_id, next.op, next.is_ready, sirius::value_of(query_id));
       if (!next.is_ready) {
         // Same re-evaluation the creation path does on exit: get_next_task_hint()
         // can have drained ports (hash join's discard sweep) in ANY pipeline the
@@ -680,6 +705,8 @@ void task_creator::manager_loop()
          request_kind,
          query_id,
          query_state = std::move(query_state)]() mutable {
+          diagnostics::timeline::span creation_request(
+            "creator_worker", node, sirius::value_of(query_id), 0, request->trace_id);
           // Scoped marker so task_creator::stop() can assert it is never called from here.
           struct worker_marker {
             worker_marker() { t_in_creation_worker = true; }
@@ -696,12 +723,20 @@ void task_creator::manager_loop()
             }
 
             while (!node->all_ports_empty()) {
-              auto task_lock  = pipeline->get_task_creation_lock();
+              diagnostics::preparation_probe probe(
+                "task_creation", pipeline.get(), node->get_operator_id());
+              auto task_lock = pipeline->get_task_creation_lock();
+              probe.mark("creation_lock");
               auto input_data = node->get_next_task_input_data();
+              probe.mark("input_wait");
+              auto* trace_input = input_data.get();
+              diagnostics::timeline::record(
+                "creator_input", creation_request.id, trace_input, node->get_operator_id());
               auto* pipelineable_input =
                 dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
               if (!input_data ||
                   (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
+                diagnostics::timeline::record("creator_no_input", creation_request.id, node);
                 // no data to create task for
                 break;
               }
@@ -854,6 +889,12 @@ void task_creator::manager_loop()
                                                               destination_data_repositories,
                                                               std::move(local_state),
                                                               gpu_pipeline_task_global_state);
+              probe.mark("construct_task");
+              diagnostics::timeline::record("scan_task_created",
+                                            creation_request.id,
+                                            task.get(),
+                                            task_id,
+                                            reinterpret_cast<uintptr_t>(trace_input));
               task_lock.unlock();
               _query_event_publisher->publish_task_created(
                 query_id, operator_id, node->type, gpu_pipeline_task_global_state->get_priority());

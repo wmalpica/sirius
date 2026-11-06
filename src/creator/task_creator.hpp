@@ -82,6 +82,7 @@ namespace sirius::creator {
  */
 
 struct task_creation_request {
+  uint64_t trace_id = 0;
   // Lives from publication through the final creator callback, including the pop/attach gap.
   exec::query_lifecycle_registry::work_lease work;
   op::sirius_physical_operator* node;

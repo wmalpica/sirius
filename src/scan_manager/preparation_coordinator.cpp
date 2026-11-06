@@ -17,6 +17,7 @@
 #include "scan_manager/preparation_coordinator.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "log/preparation_probe.hpp"
 
 #include <algorithm>
 #include <deque>
@@ -74,6 +75,7 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
   struct slot {
     enum class phase { free, running, complete } status = phase::free;
     size_t source_id = 0, cursor = 0;
+    uint64_t trace_id = 0;
     std::optional<size_t> next_free;
     std::unique_ptr<op::scan::scan_info> input;
     std::shared_ptr<preparation_unit> unit;
@@ -170,6 +172,7 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
   // publishes done under gate->mutex; the control driver then consumes the result.
   struct coalescing_operation {
     enum class kind { advance, partial, flush } type;
+    uint64_t trace_id = diagnostics::timeline::next_id();
     // For advance: originating result slot and resumable position within its input.
     size_t index = 0, cursor = 0;
     // Input moves out of the slot while running; batch is the optional emitted output.
@@ -316,10 +319,13 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
 
   struct job_ticket {
     std::shared_ptr<state> st;
-    size_t index = 0;
+    size_t index      = 0;
+    uint64_t trace_id = diagnostics::timeline::next_id();
     bool active = false, completed = false;
     ~job_ticket()
     {
+      diagnostics::timeline::record(
+        "metadata_ticket_release", trace_id, st.get(), index, completed);
       if (!active || completed) return;
       bool cancelled;
       {
@@ -408,6 +414,8 @@ struct preparation_coordinator::state : std::enable_shared_from_this<state> {
     try {
       std::lock_guard lock(gate->mutex);
       auto& s = slots[index];
+      diagnostics::timeline::record(
+        "metadata_result_ready", s.trace_id, value.get(), s.source_id, bytes);
       if (gate->closed) {
         retired = release_slot(index);
       } else {
@@ -1112,6 +1120,14 @@ bool preparation_coordinator::state::submit_coalescing(
     operation->input  = std::move(slots[index].input);
     operation->cursor = slots[index].cursor;
   }
+  diagnostics::timeline::span submission(
+    "coalescing_submit", this, id, source.domain, operation->trace_id);
+  diagnostics::timeline::record(
+    "coalescing_input",
+    operation->trace_id,
+    operation->input.get(),
+    type == coalescing_operation::kind::advance ? slots[index].trace_id : 0,
+    static_cast<uint64_t>(type));
   source.coalescing = operation;
   auto coalescer    = source.hooks.coalescer;
   auto self         = shared_from_this();
@@ -1123,6 +1139,9 @@ bool preparation_coordinator::state::submit_coalescing(
   ticket->operation = operation;
   dispatcher->enqueue(
     [self, operation, coalescer, id, queued, ticket = std::move(ticket)] {
+      diagnostics::timeline::span call(
+        "coalescing_execute", self.get(), id, self->sources[id].domain, operation->trace_id);
+      diagnostics::preparation_probe probe("coalescing", self.get(), id);
       auto started = std::chrono::steady_clock::now();
       try {
         if (!self->reader_stop.stop_requested()) {
@@ -1163,6 +1182,11 @@ bool preparation_coordinator::state::submit_coalescing(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
                                                               started)
           .count());
+      diagnostics::timeline::record("coalescing_body_done",
+                                    operation->trace_id,
+                                    operation->batch.get(),
+                                    operation->retained_bytes,
+                                    operation->finished);
       std::lock_guard done(self->gate->mutex);
       operation->done = true;
       self->gate->notify_under_lock();
@@ -1179,6 +1203,11 @@ bool preparation_coordinator::state::complete_coalescing(lock_type& lock)
     auto& source = sources[id];
     if (!source.coalescing || !source.coalescing->done) continue;
     auto operation = std::move(source.coalescing);
+    diagnostics::timeline::record("coalescing_consumed",
+                                  operation->trace_id,
+                                  operation->batch.get(),
+                                  id,
+                                  operation->retained_bytes);
     // Destruction of a rejected result can reenter the gate. Always release it unlocked.
     lock.unlock();
     if (operation->error) std::rethrow_exception(operation->error);
@@ -1243,13 +1272,19 @@ bool preparation_coordinator::state::emit_partial_batch(lock_type& lock, bool si
 bool preparation_coordinator::state::publish_batch(lock_type& lock)
 {
   if (batches.empty()) return false;
+  diagnostics::preparation_probe probe("publication", this, batches.front().source_id);
   auto batch = std::move(batches.front());
+  diagnostics::timeline::record(
+    "batch_publish_begin", 0, batch.batch.get(), batch.source_id, batch.preparation_bytes);
   batches.pop_front();
   auto& source = sources[batch.source_id];
   lock.unlock();
   {
     publication_ticket ticket{*this};
-    auto publication              = source.hooks.construct(std::move(batch.batch));
+    auto publication = source.hooks.construct(std::move(batch.batch));
+    probe.mark("construct");
+    diagnostics::timeline::record(
+      "batch_constructed", 0, publication.input.get(), batch.source_id, publication.bytes);
     publication.preparation_bytes = batch.preparation_bytes;
     if (!publication.input) throw std::logic_error("publication requires a scan input");
     bool allowed;
@@ -1259,6 +1294,7 @@ bool preparation_coordinator::state::publish_batch(lock_type& lock)
       allowed = !gate->closed && !completion->has_error();
     }
     if (allowed) publication.input->prepare_prefetch();
+    probe.mark("prefetch");
     if (allowed && before_publish) before_publish();
     auto observed =
       after_publish && publication.input->has_scan_metadata()
@@ -1325,6 +1361,8 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
       }
     }
     ready_results.pop_back();
+    diagnostics::timeline::record(
+      "metadata_result_consumed", slot.trace_id, slot.input.get(), slot.source_id, slot.cursor);
     source.active_result = index;
     if (source.asynchronous)
       return submit_coalescing(lock, slot.source_id, coalescing_operation::kind::advance, index);
@@ -1352,6 +1390,9 @@ bool preparation_coordinator::state::advance_result(lock_type& lock)
 void preparation_coordinator::state::execute_job(job& work,
                                                  std::shared_ptr<job_ticket> const& ticket)
 {
+  diagnostics::timeline::span job_span(
+    "metadata_execute", this, ticket->index, 0, ticket->trace_id);
+  diagnostics::preparation_probe probe("metadata_job", this, ticket->index);
   bool stopped;
   {
     std::lock_guard lock(gate->mutex);
@@ -1375,9 +1416,11 @@ void preparation_coordinator::state::execute_job(job& work,
       stop();
     }
   }
+  diagnostics::timeline::record("metadata_body_done", ticket->trace_id, value.get());
   work              = {};  // Captures die before settlement returns the slot.
   ticket->completed = true;
   settle(ticket->index, std::move(value));
+  diagnostics::timeline::record("metadata_settled", ticket->trace_id, this);
 }
 
 bool preparation_coordinator::state::pump_provider()
@@ -1421,6 +1464,8 @@ bool preparation_coordinator::state::pump_provider()
 void preparation_coordinator::state::dispatch_job(
   source_state& source, size_t index, job work, std::shared_ptr<job_ticket> ticket, lock_type& lock)
 {
+  diagnostics::timeline::span submission(
+    "metadata_submit", this, index, source.domain, ticket->trace_id);
   // The domain owns the captures before admission. Closing the gate rejects execution,
   // but the domain still disposes the returned job before closing its reader.
   auto admit = [&](job& owned) {
@@ -1509,12 +1554,16 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
     ticket->st    = self;
     ticket->index = index;
     reserve_slot(index, id);
+    slots[index].trace_id = ticket->trace_id;
+    diagnostics::timeline::record("metadata_claim", ticket->trace_id, this, id, index);
     ticket->active = true;
     // This slot reserves the claim before unlocking. Only the control driver retires
     // sources, so stop may close admission but cannot close the reader during the claim.
     lock.unlock();
     if (source.on_native_reader()) source.native.begin_claim(std::move(ticket));
     auto claimed = source.hooks.try_claim();
+    diagnostics::timeline::record(
+      "metadata_claim_result", ticket ? ticket->trace_id : 0, this, id, claimed.index());
     if (auto* ready = std::get_if<job>(&claimed)) {
       dispatch_job(source, index, std::move(*ready), std::move(ticket), lock);
       next_claim_source = id + 1;
@@ -1728,9 +1777,11 @@ bool preparation_coordinator::state::finish_step()
 preparation_coordinator::state::control_step_result preparation_coordinator::state::control_step(
   std::shared_ptr<state> const& st)
 {
+  diagnostics::preparation_probe probe("control_step", this);
   // The driver owns control_active. This turn bounds actions, not hook duration.
   using next = control_step_result::status;
   std::unique_lock lock(gate->mutex);
+  probe.mark("gate_lock");
   ++stats.wakes;
   if (gate->closed) return {next::retire};
   gate->check_interrupted();
@@ -1754,6 +1805,15 @@ preparation_coordinator::state::control_step_result preparation_coordinator::sta
   if (gate->interrupted) {
     auto end = op::scan::batch_coalescer::clock::now() + options.interrupt_check_interval;
     deadline = deadline ? std::min(*deadline, end) : end;
+  }
+  for (size_t i = 0; i < sources.size(); ++i) {
+    auto const& source = sources[i];
+    diagnostics::timeline::record(
+      "control_park_source", 0, this, i, static_cast<uint64_t>(source.status));
+    diagnostics::timeline::record(
+      "control_park_work", 0, &source, source.outstanding, source.pending_batches);
+    diagnostics::timeline::record(
+      "control_park_bytes", 0, &source, source.work_bytes, source.window_bytes);
   }
   return {next::parked, observed_wake, deadline};
 }

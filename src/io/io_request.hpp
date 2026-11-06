@@ -212,6 +212,13 @@ class grouped_coordinator final {
  */
 class grouped_io_request final {
  public:
+  // Investigation-only lineage, set under the reactor's enqueue mutex before
+  // publication. Zero means queue tracing is disabled. It travels with the
+  // request so dequeue can report age without a shared request registry.
+  uint64_t queue_trace_sequence{0};
+  uint64_t queue_trace_enqueued_ns{0};
+  uint64_t queue_trace_parent{0};
+
   static std::unique_ptr<grouped_io_request> create(
     std::shared_ptr<const io_object> object,
     std::vector<prepared_io_slice> slices,

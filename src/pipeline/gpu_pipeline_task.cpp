@@ -21,6 +21,7 @@
 #include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
+#include "log/preparation_probe.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -281,7 +282,8 @@ std::unique_ptr<op::operator_data> run_one_operator(
   try {
     materialized = materialize_deferred_input(op, operator_input_data, stream, host_staging_space);
     auto const& effective_input = materialized ? *materialized : operator_input_data;
-    operator_output_data        = op.execute(effective_input, stream);
+    diagnostics::timeline::span operator_span("operator_execute", &op);
+    operator_output_data = op.execute(effective_input, stream);
   } catch (const std::exception& ex) {
     // Both the original input and any restored deferred input are still alive here. Quiesce the
     // stream before rethrowing lets their owners unwind only after their last GPU reader finishes.
@@ -667,6 +669,7 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data,
 
 void gpu_pipeline_task::execute(::cuda::stream_ref stream)
 {
+  diagnostics::timeline::span task_execution("gpu_task_execute", this);
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto operators    = pipeline->get_operators();
@@ -732,7 +735,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
            .data   = {.bytes = _reservation_bytes},
      }});
   try {
+    diagnostics::preparation_probe probe("prepare_for_processing", this);
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+    probe.mark("input_prepare");
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
     // is accurate.
     stream.sync();

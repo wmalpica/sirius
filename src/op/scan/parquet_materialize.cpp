@@ -17,6 +17,7 @@
 #include "op/scan/parquet_materialize.hpp"
 
 #include "io/types.hpp"
+#include "log/preparation_probe.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
@@ -51,10 +52,13 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_range_cache::ranges(
   std::shared_ptr<cudf::io::parquet_reader_options const> const& options,
   std::vector<cudf::size_type> const& row_group_indices)
 {
+  diagnostics::preparation_probe probe("range_cache", this);
   if (row_group_indices.empty()) { return {}; }
   if (!_reader || _metadata != metadata || _options != options) {
     _reader.reset();
-    _reader   = std::make_unique<hybrid_scan_reader>(*metadata, *options);
+    probe.mark("destroy_reader");
+    _reader = std::make_unique<hybrid_scan_reader>(*metadata, *options);
+    probe.mark("construct_reader");
     _metadata = metadata;
     _options  = options;
   }

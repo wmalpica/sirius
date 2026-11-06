@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/invocable.hpp"
+#include "log/preparation_timeline.hpp"
 
 #include <exec/thread_pool.hpp>
 
@@ -71,6 +72,8 @@ class scoped_dispatcher {
   void enqueue(scoped_dispatcher_task auto&& f, int domain = -1, bool coalescing = false)
   {
     queued_task task{wrap(std::forward<decltype(f)>(f)), domain};
+    diagnostics::timeline::record(
+      "dispatch_submit", task.trace_id, this, domain, coalescing, task.parent);
 
     std::unique_lock lk(mu_);
     if (stop_.stop_requested()) return;
@@ -80,6 +83,8 @@ class scoped_dispatcher {
       lk.unlock();
       submit(std::move(task));
     } else {
+      diagnostics::timeline::record(
+        "dispatch_pending", task.trace_id, this, domain, inflight_, task.parent);
       pending_[coalescing].push_back(std::move(task));
     }
   }
@@ -152,8 +157,10 @@ class scoped_dispatcher {
  private:
   using task_t = sirius::exec::invocable<void()>;
   struct queued_task {
-    task_t work;      // Owns the callback and its captures until execution or cancellation.
-    int domain = -1;  // Pool domain index; -1 permits execution by any pool worker.
+    task_t work;             // Owns the callback and its captures until execution or cancellation.
+    int domain        = -1;  // Pool domain index; -1 permits execution by any pool worker.
+    uint64_t trace_id = diagnostics::timeline::next_id();
+    uint64_t parent   = diagnostics::timeline::context;
   };
 
   static void log_exception_ptr(const std::exception_ptr& eptr,
@@ -208,6 +215,8 @@ class scoped_dispatcher {
 
   void run(queued_task task) noexcept
   {
+    diagnostics::timeline::record(
+      "dispatch_worker_start", task.trace_id, this, task.domain, 0, task.parent);
     if (!pool_.num_domains()) {
       run_unrouted(std::move(task));
       return;
@@ -220,7 +229,11 @@ class scoped_dispatcher {
       } catch (...) {
       }
     }
+    diagnostics::timeline::record(
+      "dispatch_body_done", task.trace_id, this, task.domain, 0, task.parent);
     task.work = nullptr;  // Dispose captures outside mu_.
+    diagnostics::timeline::record(
+      "dispatch_disposed", task.trace_id, this, task.domain, 0, task.parent);
     {
       std::unique_lock lk(mu_);
       if (stop_.stop_requested() || pending_empty()) {
@@ -301,6 +314,8 @@ class scoped_dispatcher {
   {
     try {
       auto domain = task.domain;
+      diagnostics::timeline::record(
+        "dispatch_pool_submit", task.trace_id, this, domain, 0, task.parent);
       pool_.schedule(
         [this, task = std::move(task)]() mutable { run(std::move(task)); }, priority_, domain);
     } catch (...) {

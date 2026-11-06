@@ -16,6 +16,7 @@
 
 #include "scan_manager/split_connector.hpp"
 
+#include "log/preparation_timeline.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 
@@ -67,6 +68,8 @@ void split_connector::push_prepared_scan(std::unique_ptr<op::scan::scan_operator
     std::lock_guard lock(_mutex);
     if (_closed) throw std::logic_error("prepared scan published after connector close");
     _splits.emplace_back();  // Allocate before moving or erasing the concrete type.
+    diagnostics::timeline::record(
+      "split_published", 0, input.get(), reinterpret_cast<uintptr_t>(this), source_id);
     _splits.back() = {std::move(input), preparation_bytes, source_id};
     _discovered_bytes += bytes;
     _has_unsized_splits = _has_unsized_splits || bytes == 0;
@@ -89,12 +92,20 @@ void split_connector::close(std::exception_ptr const& exception)
 
 std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_split()
 {
+  diagnostics::timeline::span waiting("connector_pop", this);
   std::unique_lock<std::mutex> lock(_mutex);
+  diagnostics::timeline::record("connector_wait_begin", waiting.id, this, _splits.size());
   _cv.wait(lock, [this] { return !_splits.empty() || _closed; });
+  diagnostics::timeline::record("connector_wait_end", waiting.id, this, _splits.size(), _closed);
   // if there is an exception, propagate it to the consumer instead of returning more splits
   if (_exception) { std::rethrow_exception(_exception); }
   if (!_splits.empty()) {
     auto split = std::move(_splits.front());
+    diagnostics::timeline::record("split_consumed",
+                                  waiting.id,
+                                  split.input.get(),
+                                  reinterpret_cast<uintptr_t>(this),
+                                  split.source_id);
     _splits.pop_front();
     _last_pop_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now().time_since_epoch())

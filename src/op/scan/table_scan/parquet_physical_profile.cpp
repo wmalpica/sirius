@@ -1,3 +1,4 @@
+#include "log/preparation_timeline.hpp"
 /*
  * Copyright 2026, Sirius Contributors.
  *
@@ -14,11 +15,10 @@
  * limitations under the License.
  */
 
-#include "op/scan/table_scan/parquet_physical_profile.hpp"
-
 #include "io/parquet_helpers.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/table_scan/parquet_physical_profile.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -170,6 +170,7 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
   bool* cache_hit,
   std::stop_token stop)
 {
+  diagnostics::timeline::span resolution("metadata_cache_resolve", &source);
   auto const observed_identity = source.get_io_object().identity_cache_key();
   // Profile all schema-affecting reader options. Custom nested column schemas
   // are not yet serialised; bypass cache instead of conflating their results.
@@ -224,17 +225,22 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
   }
   if (cache_hit) *cache_hit = false;
   auto build = [&]() -> std::shared_ptr<io::io_object_metadata> {
+    diagnostics::timeline::span build_span("metadata_cache_build", &source);
     auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
+    diagnostics::timeline::record("footer_read_complete", build_span.id, &source, footer->size());
     crypto_reader probe({footer->data(), footer->size()});
     auto encryption = probe.read();
     if (!encryption.complete || probe.original_schema().empty()) {
       throw std::runtime_error("incomplete Parquet footer evidence: " + identity);
     }
+    diagnostics::timeline::record("footer_reader_begin", build_span.id, &source);
     cudf::io::parquet::experimental::hybrid_scan_reader reader(
       cudf::host_span<uint8_t const>(footer->data(), footer->size()),
       canonical ? default_options : options);
+    diagnostics::timeline::record("footer_reader_end", build_span.id, &source);
     auto parsed =
       std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+    diagnostics::timeline::record("metadata_copy_end", build_span.id, parsed.get());
     std::string arrow_schema;
     for (auto const& entry : parsed->key_value_metadata) {
       if (entry.key == "ARROW:schema") {
@@ -275,6 +281,8 @@ parquet_metadata_resolution resolve_parquet_metadata_with_identity(
       throw std::runtime_error("[parquet] metadata loader returned an incompatible artifact");
     std::ignore = source.store_metadata(result);
   }
+  diagnostics::timeline::record(
+    "metadata_cache_result", resolution.id, result.get(), cache_hit && *cache_hit);
   return {result, result->built_for_identity};
 }
 
@@ -294,6 +302,7 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_plaintext_parquet_footer(
   cudf::io::datasource& source, scan_contract_id contract, std::string const& identity)
 {
   try {
+    diagnostics::timeline::span fetch("footer_read", &source);
     return cudf::io::parquet::fetch_footer_to_host(source);
   } catch (...) {
     auto original  = std::current_exception();
