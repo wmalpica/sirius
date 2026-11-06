@@ -261,6 +261,9 @@ class uring_reactor {
   std::stop_source _stop_source;
   std::jthread _worker;
   duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<grouped_io_request>> _requests;
+  // All callers serialize on _enqueue_mutex, so one producer token makes
+  // incoming requests globally FIFO without changing the consumer or grouping.
+  duckdb_moodycamel::ProducerToken _fifo_producer{_requests};
   mutable std::mutex _enqueue_mutex;
   // Diagnostic order counters. Enqueue is protected by _enqueue_mutex;
   // dequeue has one consumer (worker, or shutdown after the worker exits).

@@ -559,7 +559,7 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
       }
       _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
       try {
-        enqueued = _requests.enqueue(std::move(request));
+        enqueued = _requests.enqueue(_fifo_producer, std::move(request));
         if (!enqueued) { error = std::make_error_code(std::errc::no_buffer_space); }
       } catch (...) {
         enqueued = false;
