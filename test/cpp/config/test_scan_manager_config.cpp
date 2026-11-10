@@ -38,8 +38,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 #include <utility>
+#include <vector>
 
 using cucascade::io::cache::cache_mode;
 using cucascade::io::cache::eviction_policy;
