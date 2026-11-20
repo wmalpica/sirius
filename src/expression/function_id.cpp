@@ -42,7 +42,7 @@ struct function_signature {
 
 constexpr std::size_t kVariadic = std::numeric_limits<std::size_t>::max();
 
-constexpr std::array<function_signature, 43> kSignatures = {{
+constexpr std::array<function_signature, 44> kSignatures = {{
   {"+", function_id::add, 2, 2},
   {"add", function_id::add, 2, 2},
   {"-", function_id::sub, 2, 2},
@@ -87,22 +87,28 @@ constexpr std::array<function_signature, 43> kSignatures = {{
   {"-", function_id::negate, 1, 1},
   {"subtract", function_id::negate, 1, 1},
   {"negate", function_id::negate, 1, 1},  // Substrait spelling
+  {"sirius_decimal_divide", function_id::decimal_divide, 3, 3},
 }};
 
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 35> kReverseTable = {
-  "+",          "-",         "*",           "/",           "//",
-  "%",          "substring", "~~",          "!~~",         "contains",
-  "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
-  "concat",     "||",        "year",        "month",       "day",
-  "hour",       "minute",    "second",      "millisecond", "microsecond",
-  "date_trunc", "row",       "struct_pack", "error",       "constant_or_null",
-  "upper",      "lower",     "round",       "abs",         "-"};
+constexpr std::array<std::string_view, 36> kReverseTable = {
+  "+",           "-",          "*",
+  "/",           "//",         "%",
+  "substring",   "~~",         "!~~",
+  "contains",    "prefix",     "suffix",
+  "strlen",      "length",     "regexp_replace",
+  "concat",      "||",         "year",
+  "month",       "day",        "hour",
+  "minute",      "second",     "millisecond",
+  "microsecond", "date_trunc", "row",
+  "struct_pack", "error",      "constant_or_null",
+  "upper",       "lower",      "round",
+  "abs",         "-",          "sirius_decimal_divide"};
 
-static_assert(static_cast<std::size_t>(function_id::negate) + 1 == 35,
-              "function_id::negate must be the last entry; cardinality locked at 35.");
-static_assert(kReverseTable.size() == 35,
+static_assert(static_cast<std::size_t>(function_id::decimal_divide) + 1 == 36,
+              "function_id::decimal_divide must be the last entry; cardinality locked at 36.");
+static_assert(kReverseTable.size() == 36,
               "kReverseTable must have one slot per function_id value.");
 
 // Each id has exactly one row named as in kReverseTable, and rows sharing a name have disjoint

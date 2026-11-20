@@ -69,8 +69,11 @@ class convertible_data_batch : public convertible_data {
    *                     conversion from any space.
    */
   explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch,
-                                  cucascade::memory::memory_space const* source_space = nullptr)
-    : _batch(std::move(batch)), _source_space(source_space)
+                                  cucascade::memory::memory_space const* source_space = nullptr,
+                                  bool recheck_subscription                           = false)
+    : _batch(std::move(batch)),
+      _source_space(source_space),
+      _recheck_subscription(recheck_subscription)
   {
   }
 
@@ -122,6 +125,10 @@ class convertible_data_batch : public convertible_data {
       if (!mut_opt) { return std::nullopt; }
     }
     auto& mut = *mut_opt;
+    // A repository candidate can become an in-flight exchange buffer after selection.
+    // Recheck under the exclusive lock; export subscribes while holding its read lock.
+    // This preserves ignore_subscribed's contract across that handoff.
+    if (_recheck_subscription && _batch->get_subscriber_count() > 0) { return std::nullopt; }
 
     auto cur_space = mut.get_memory_space();
     if (!should_convert(cur_space, _source_space, target_spaces)) { return std::nullopt; }
@@ -255,6 +262,7 @@ class convertible_data_batch : public convertible_data {
   std::shared_ptr<cucascade::data_batch> _batch;
   /// Non-owning; null converts the batch from any space.
   cucascade::memory::memory_space const* _source_space{nullptr};
+  bool _recheck_subscription{false};
 };
 
 /**
@@ -414,7 +422,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch), space);
+      return std::make_unique<convertible_data_batch>(std::move(batch), space, ignore_subscribed);
     }
 
     return nullptr;

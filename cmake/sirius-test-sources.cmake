@@ -1,5 +1,14 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/exec/test_starrocks_substrait_compat.cpp
+    test/cpp/helper/test_decimal_divide.cpp
+    test/cpp/expression_evaluator/test_decimal_divide.cpp
+    test/cpp/exec/test_exchange_inbox.cpp
+    test/cpp/exec/test_exchange_ring.cpp
+    test/cpp/exec/test_exchange_ring_ends.cpp
+    test/cpp/exec/test_exchange_ring_wire.cpp
+    test/cpp/exec/test_starrocks_ffi_embedder.cpp
+
     test/cpp/output/test_parquet_session.cpp
     test/cpp/integration/test_parquet_output.cpp
     test/cpp/scan/test_parquet_delete_reader.cpp

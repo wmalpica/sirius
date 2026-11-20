@@ -2580,17 +2580,38 @@ fn decimal_literal_encodes_little_endian_unscaled_value() {
     }
 }
 
-/// A decimal literal wider than 18 digits follows the slot rule and is emitted as FP64.
+/// A decimal literal wider than 18 digits stays an exact decimal (q18's `300`, q17's `7.0`).
 #[test]
-fn wide_decimal_literal_is_lowered_to_fp64() {
+fn wide_decimal_literal_stays_decimal() {
     let plan = filter_with_conjunct(binary_pred(
         TExprOpcode::EQ,
         slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
-        decimal_literal("1.5", 19, 2),
+        decimal_literal("1.5", 38, 2),
     ));
     match literal_type(scalar_arg(filter_condition(&plan), 1)) {
-        expression::literal::LiteralType::Fp64(value) => assert_eq!(*value, 1.5),
-        other => panic!("expected fp64 literal, got {other:?}"),
+        expression::literal::LiteralType::Decimal(decimal) => {
+            assert_eq!((decimal.precision, decimal.scale), (38, 2));
+            assert_eq!(decimal.value[..2], [150, 0]);
+        }
+        other => panic!("expected a decimal literal, got {other:?}"),
+    }
+}
+
+/// DuckDB stores a DECIMAL of precision 4 or less as INT16, which the GPU can't hold, so a
+/// small literal (q17's `0.2` is DECIMAL(1,1)) is widened to precision 5 at the same scale.
+#[test]
+fn small_decimal_literal_is_widened_to_precision_5() {
+    let plan = filter_with_conjunct(binary_pred(
+        TExprOpcode::EQ,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        decimal_literal("0.2", 1, 1),
+    ));
+    match literal_type(scalar_arg(filter_condition(&plan), 1)) {
+        expression::literal::LiteralType::Decimal(decimal) => {
+            assert_eq!((decimal.precision, decimal.scale), (5, 1));
+            assert_eq!(decimal.value[0], 2);
+        }
+        other => panic!("expected a decimal literal, got {other:?}"),
     }
 }
 
@@ -2817,7 +2838,14 @@ fn aggregate_expr(name: &str, ret_type: TTypeDesc, child: Option<TExpr>) -> TExp
     let num_children = child.as_ref().map(|_| 1).unwrap_or(0);
     let mut node = base_expr_node(TExprNodeType::AGG_EXPR, ret_type.clone(), num_children);
     node.agg_expr = Some(TAggregateExpr::new(false));
-    node.fn_ = Some(builtin_function(name, ret_type));
+    let mut function = builtin_function(name, ret_type);
+    // The FE records the argument's type, which a decimal AVG's sum takes its scale from.
+    function.arg_types = child
+        .as_ref()
+        .and_then(|child| child.nodes.first())
+        .map(|argument| vec![argument.type_.clone()])
+        .unwrap_or_default();
+    node.fn_ = Some(function);
     let mut nodes = vec![node];
     if let Some(child) = child {
         nodes.extend(child.nodes);
@@ -3291,6 +3319,141 @@ fn left_semi_join_keeps_probe_layout() {
         join.r#type,
         substrait::proto::join_rel::JoinType::LeftSemi as i32
     );
+}
+
+/// Two-column sides for right semi/anti tests: tuple 0 = probe(`a`, `b`), tuple 1 =
+/// build(`c`, `d`). The build side starts at field 2 of the concatenated row and at field 0 of
+/// the join's output.
+fn two_by_two_join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 1, "d", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Builds a `join_op` hash join on `a = c` with the extra join conjunct `b <> d`, the shape of
+/// q21's EXISTS / NOT EXISTS (`l2.l_suppkey <> l1.l_suppkey`).
+fn join_with_other_conjunct(join_op: TJoinOp) -> TPlanNode {
+    let bigint = || scalar_type(TPrimitiveType::BIGINT);
+    let mut join = hash_join_node(join_op);
+    join.hash_join_node.as_mut().unwrap().other_join_conjuncts = Some(vec![binary_pred(
+        TExprOpcode::NE,
+        slot_ref(2, 0, bigint()),
+        slot_ref(2, 1, bigint()),
+    )]);
+    join
+}
+
+/// Asserts a join condition is `equal(a, c) AND not_equal(b, d)` over the concatenated
+/// probe-then-build row.
+fn assert_eq_and_ne_condition(
+    plan: &substrait::proto::Plan,
+    condition: &substrait::proto::Expression,
+) {
+    let conjunction = scalar_fn(condition);
+    assert_eq!(
+        resolved_function(plan, conjunction.function_reference).1,
+        "and"
+    );
+    let operands: Vec<_> = conjunction
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => scalar_fn(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect();
+    let names: Vec<_> = operands
+        .iter()
+        .map(|operand| resolved_function(plan, operand.function_reference).1)
+        .collect();
+    assert_eq!(names, vec!["equal", "not_equal"]);
+    assert_eq!(argument_field_indices(operands[0]), vec![0, 2]);
+    assert_eq!(argument_field_indices(operands[1]), vec![1, 3]);
+}
+
+/// A right semi join (the FE's EXISTS / IN) is a Substrait RIGHT_SEMI join that keeps only the
+/// build side's columns, with the extra join conjunct inside the join condition: as a filter
+/// after the join it would test one arbitrary match instead of asking whether any match exists.
+/// Slots above the join resolve against the build-side layout.
+#[test]
+fn right_semi_join_keeps_build_layout_and_other_conjuncts() {
+    let mut join = join_with_other_conjunct(TJoinOp::RIGHT_SEMI_JOIN);
+    join.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(two_by_two_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["c", "d"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the node conjunct's filter over the join");
+    };
+    // `d` is field 1 of the join's build-only output, not field 3 of the concatenated row.
+    let greater = scalar_fn(filter.condition.as_deref().unwrap());
+    let substrait::proto::function_argument::ArgType::Value(d) =
+        greater.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(field_index(d), 1);
+
+    let rel::RelType::Join(join) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the join under the filter");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::RightSemi as i32
+    );
+    assert_eq_and_ne_condition(&translated.plan, join.expression.as_ref().unwrap());
+}
+
+/// A right anti join (the FE's NOT EXISTS) keeps its extra join conjunct inside the RIGHT join's
+/// condition, so a build row survives the `is_null(probe key)` filter only when no probe row
+/// satisfies the whole condition. The output is the build side's columns.
+#[test]
+fn right_anti_join_keeps_other_conjuncts_in_the_join_condition() {
+    let plan = TPlan::new(vec![
+        join_with_other_conjunct(TJoinOp::RIGHT_ANTI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(two_by_two_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["c", "d"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the output projection under the root");
+    };
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![2, 3]);
+    let rel::RelType::Filter(filter) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the anti-join filter under the projection");
+    };
+    assert_eq!(
+        scalar_function_name(&translated.plan, filter.condition.as_ref().unwrap()),
+        "is_null"
+    );
+    let rel::RelType::Join(join) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the join under the filter");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Right as i32
+    );
+    assert_eq_and_ne_condition(&translated.plan, join.expression.as_ref().unwrap());
 }
 
 /// Builds a nested-loop join plan node carrying `conjuncts` as its join predicate.
@@ -3964,51 +4127,680 @@ fn two_phase_sum_stays_sum() {
         "{:?}",
         extension_function_names(&merge_plan.plan)
     );
-    let rel::RelType::Aggregate(aggregate) = root(&merge_plan.plan)
-        .input
-        .as_ref()
-        .unwrap()
-        .rel_type
-        .as_ref()
-        .unwrap()
-    else {
-        panic!("expected merge aggregate");
-    };
-    assert_eq!(aggregate.measures.len(), 1);
+    assert_eq!(root_aggregate(&merge_plan.plan).measures.len(), 1);
 }
 
-/// Two-phase AVG is rejected: this GROUP BY shuffle path only lowers SUM.
-#[test]
-fn two_phase_avg_is_rejected() {
-    let mut avg = aggregate_expr(
-        "avg",
-        scalar_type(TPrimitiveType::DOUBLE),
-        Some(slot_ref(1, 1, scalar_type(TPrimitiveType::DOUBLE))),
+/// Builds a merge (`is_merge_agg`) measure `name(child)`.
+fn merge_aggregate_expr(name: &str, ret_type: TTypeDesc, child: TExpr) -> TExpr {
+    let mut expr = aggregate_expr(name, ret_type, Some(child));
+    expr.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    expr
+}
+
+/// Descriptor for two-phase tests: scan tuple 0 (`id` BIGINT, `name` VARCHAR, `price`
+/// DECIMAL64(15,2)) and aggregation tuple 1 (`name` key, `state` declared as `state_type`).
+fn two_phase_desc(state_type: TTypeDesc) -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "price", decimal64_15_2()),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "state", state_type),
+        ],
+    )
+}
+
+fn decimal64_15_2() -> TTypeDesc {
+    scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2))
+}
+
+/// Translates a partial aggregation over the scan of [`two_phase_desc`], grouped by `name`.
+fn translate_partial(
+    measure: TExpr,
+    state_type: TTypeDesc,
+) -> Result<TranslatedPlan, TranslateError> {
+    let mut partial = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![measure],
     );
-    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
-    let merge = aggregation_node(8, 1, Vec::new(), vec![avg]);
-    // Merge AVG reads the exchange's partial-state column (tuple 1), not the scan tuple.
-    let err = translate_with_streams(
+    partial.agg_node.as_mut().unwrap().need_finalize = false;
+    translate_fragment(&params(
+        Some(TPlan::new(vec![partial, scan_node(0, 0)])),
+        Some(two_phase_desc(state_type)),
+        None,
+    ))
+}
+
+/// Translates a merge aggregation of `measure` over exchange 7, grouped by `name`.
+fn translate_merge(
+    measure: TExpr,
+    state_type: TTypeDesc,
+) -> Result<TranslatedPlan, TranslateError> {
+    let merge = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![measure],
+    );
+    translate_with_streams(
         TPlan::new(vec![merge, exchange_node(7, vec![1])]),
-        scalar_agg_desc_for_avg(),
+        two_phase_desc(state_type),
+        &[stream_input(7, &["name", "state"])],
+    )
+}
+
+/// Returns the aggregate relation under the plan root, looking through the projection that casts
+/// a two-phase integer `sum` back to its declared type.
+fn root_aggregate(plan: &substrait::proto::Plan) -> &substrait::proto::AggregateRel {
+    let mut rel = root(plan).input.as_ref().unwrap();
+    if let Some(rel::RelType::Project(project)) = rel.rel_type.as_ref() {
+        rel = project.input.as_ref().unwrap();
+    }
+    let Some(rel::RelType::Aggregate(aggregate)) = rel.rel_type.as_ref() else {
+        panic!("expected aggregate relation under the root");
+    };
+    aggregate
+}
+
+/// The types the projection above the root aggregate casts its columns to, by column; `None` for
+/// a column passed through.
+fn root_casts(plan: &substrait::proto::Plan) -> Vec<Option<substrait::proto::Type>> {
+    let Some(rel::RelType::Project(project)) = root(plan).input.as_ref().unwrap().rel_type.as_ref()
+    else {
+        return Vec::new();
+    };
+    project
+        .expressions
+        .iter()
+        .map(|expr| match expr.rex_type.as_ref() {
+            Some(expression::RexType::Cast(cast)) => cast.r#type.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Returns the name and output type of the aggregate's only measure.
+fn sole_measure(plan: &substrait::proto::Plan) -> (String, &substrait::proto::AggregateFunction) {
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    let aggregate = root_aggregate(plan);
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    let name = plan
+        .extensions
+        .iter()
+        .find_map(|declaration| match declaration.mapping_type.as_ref() {
+            Some(MappingType::ExtensionFunction(function))
+                if function.function_anchor == measure.function_reference =>
+            {
+                Some(function.name.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    (name, measure)
+}
+
+/// Returns the DuckDB types the plan declares for its only input stream.
+fn stream_types(plan: &TranslatedPlan) -> Vec<String> {
+    assert_eq!(plan.stream_inputs.len(), 1);
+    plan.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| column.ty.clone())
+        .collect()
+}
+
+fn type_kind(ty: Option<&substrait::proto::Type>) -> &substrait::proto::r#type::Kind {
+    ty.unwrap().kind.as_ref().unwrap()
+}
+
+/// Partial COUNT(*) emits a BIGINT count per group, after the grouping key.
+#[test]
+fn two_phase_partial_count_emits_bigint_counts() {
+    let plan = translate_partial(
+        aggregate_expr("count", scalar_type(TPrimitiveType::BIGINT), None),
+        scalar_type(TPrimitiveType::BIGINT),
+    )
+    .unwrap();
+    assert_eq!(root(&plan.plan).names, ["name", "state"]);
+    let (name, measure) = sole_measure(&plan.plan);
+    assert_eq!(name, "count");
+    assert!(measure.arguments.is_empty());
+    assert!(matches!(
+        type_kind(measure.output_type.as_ref()),
+        substrait::proto::r#type::Kind::I64(_)
+    ));
+}
+
+/// Merge COUNT sums the partial counts it reads from the exchange: counting them would count
+/// partial rows instead.
+#[test]
+fn two_phase_merge_count_sums_partial_counts() {
+    let plan = translate_merge(
+        merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        ),
+        scalar_type(TPrimitiveType::BIGINT),
+    )
+    .unwrap();
+    assert_eq!(stream_types(&plan), ["VARCHAR", "BIGINT"]);
+    assert_eq!(root(&plan.plan).names, ["name", "state"]);
+    let (name, measure) = sole_measure(&plan.plan);
+    assert_eq!(name, "sum");
+    assert!(!extension_function_names(&plan.plan).contains(&"count".to_string()));
+    let Some(substrait::proto::function_argument::ArgType::Value(argument)) =
+        &measure.arguments[0].arg_type
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(struct_field(argument), 1);
+    assert!(matches!(
+        type_kind(measure.output_type.as_ref()),
+        substrait::proto::r#type::Kind::I64(_)
+    ));
+}
+
+/// A global (no GROUP BY) merge COUNT also sums. It never sees zero rows: every partial
+/// instance of an ungrouped aggregation emits one row, a 0 count when its input was empty, so
+/// the sum is 0 rather than NULL over an empty table.
+#[test]
+fn two_phase_global_merge_count_sums_partial_counts() {
+    let merge = aggregation_node(
+        8,
+        1,
+        Vec::new(),
+        vec![merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let desc = desc_table(
+        vec![(1, None)],
+        vec![slot(1, 1, "total", scalar_type(TPrimitiveType::BIGINT))],
+    );
+    let plan = translate_with_streams(
+        TPlan::new(vec![merge, exchange_node(7, vec![1])]),
+        desc,
         &[stream_input(7, &["total"])],
+    )
+    .unwrap();
+    assert_eq!(stream_types(&plan), ["BIGINT"]);
+    assert!(root_aggregate(&plan.plan).groupings.is_empty());
+    assert_eq!(sole_measure(&plan.plan).0, "sum");
+}
+
+/// Partial MIN/MAX emit their input type, a DECIMAL64(15,2) here.
+#[test]
+fn two_phase_partial_min_max_emit_the_input_type() {
+    for function in ["min", "max"] {
+        let plan = translate_partial(
+            aggregate_expr(
+                function,
+                decimal64_15_2(),
+                Some(slot_ref(3, 0, decimal64_15_2())),
+            ),
+            decimal64_15_2(),
+        )
+        .unwrap();
+        assert_eq!(root(&plan.plan).names, ["name", "state"]);
+        let (name, measure) = sole_measure(&plan.plan);
+        assert_eq!(name, function);
+        let substrait::proto::r#type::Kind::Decimal(decimal) =
+            type_kind(measure.output_type.as_ref())
+        else {
+            panic!("expected a decimal partial state");
+        };
+        assert_eq!((decimal.precision, decimal.scale), (15, 2));
+    }
+}
+
+/// Merge MIN/MAX re-apply the same function, and the exchange carries the partial state with
+/// the type the rule gives it (the function's input type), not the descriptor's slot type,
+/// which this test declares wrongly on purpose.
+#[test]
+fn two_phase_merge_min_max_type_the_exchange_by_rule() {
+    for function in ["min", "max"] {
+        let plan = translate_merge(
+            merge_aggregate_expr(function, decimal64_15_2(), slot_ref(2, 1, decimal64_15_2())),
+            scalar_type(TPrimitiveType::DOUBLE),
+        )
+        .unwrap();
+        assert_eq!(stream_types(&plan), ["VARCHAR", "DECIMAL(15,2)"]);
+        let (name, measure) = sole_measure(&plan.plan);
+        assert_eq!(name, function);
+        let Some(substrait::proto::function_argument::ArgType::Value(argument)) =
+            &measure.arguments[0].arg_type
+        else {
+            panic!("expected a value argument");
+        };
+        assert_eq!(struct_field(argument), 1);
+    }
+}
+
+/// A partial MIN whose argument type differs from its return type would emit a column the
+/// merge side does not declare, so it is refused.
+#[test]
+fn two_phase_partial_min_with_a_mismatched_argument_is_rejected() {
+    let err = translate_partial(
+        aggregate_expr(
+            "min",
+            decimal64_15_2(),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        ),
+        decimal64_15_2(),
     )
     .unwrap_err();
     let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
         panic!("expected unsupported plan node, got {err:?}");
     };
-    assert!(reason.contains("SUM"), "{reason}");
+    assert!(reason.contains("argument type differs"), "{reason}");
 }
 
-/// Descriptor for a grouping-free merge of one DOUBLE measure.
-fn scalar_agg_desc_for_avg() -> TDescriptorTable {
+fn decimal128(precision: i32, scale: i32) -> TTypeDesc {
+    scalar_type_with(
+        TPrimitiveType::DECIMAL128,
+        None,
+        Some(precision),
+        Some(scale),
+    )
+}
+
+/// Descriptor for the two-phase AVG tests: scan tuple 0 (`id` BIGINT, `name` VARCHAR, `price`
+/// DECIMAL64(15,2)); partial tuple 1 with the FE's slot types, VARBINARY for each AVG state;
+/// and the merge's output tuple 2 with the final types.
+fn two_phase_avg_desc() -> TDescriptorTable {
     desc_table(
-        vec![(0, Some(100)), (1, None)],
+        vec![(0, Some(100)), (1, None), (2, None)],
         vec![
             slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(1, 1, "total", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "price", decimal64_15_2()),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "avg_id", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(3, 1, "avg_price", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(4, 1, "n", scalar_type(TPrimitiveType::BIGINT)),
+            slot(5, 1, "total", decimal128(38, 2)),
+            slot(1, 2, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 2, "avg_id", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(3, 2, "avg_price", decimal128(38, 8)),
+            slot(4, 2, "n", scalar_type(TPrimitiveType::BIGINT)),
+            slot(5, 2, "total", decimal128(38, 2)),
         ],
     )
+}
+
+/// Translates the partial step of `avg(id), avg(price), count(*), sum(price) GROUP BY name`,
+/// the FE's two AVG shapes (an integer input returning DOUBLE, a decimal input returning
+/// DECIMAL128(38,8)) followed by measures whose columns AVG shifts.
+fn translate_partial_avg() -> TranslatedPlan {
+    let mut partial = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![
+            aggregate_expr(
+                "avg",
+                scalar_type(TPrimitiveType::DOUBLE),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            ),
+            aggregate_expr(
+                "avg",
+                decimal128(38, 8),
+                Some(slot_ref(3, 0, decimal64_15_2())),
+            ),
+            aggregate_expr("count", scalar_type(TPrimitiveType::BIGINT), None),
+            aggregate_expr(
+                "sum",
+                decimal128(38, 2),
+                Some(slot_ref(3, 0, decimal64_15_2())),
+            ),
+        ],
+    );
+    partial.agg_node.as_mut().unwrap().need_finalize = false;
+    translate_fragment(&params(
+        Some(TPlan::new(vec![partial, scan_node(0, 0)])),
+        Some(two_phase_avg_desc()),
+        None,
+    ))
+    .unwrap()
+}
+
+/// Translates the merge step of [`translate_partial_avg`] over exchange 7, whose sender
+/// emitted `names`. The merge names its partial states through `state_tuple`; the exchange
+/// carries tuple 1.
+fn translate_merge_avg(names: &[&str], state_tuple: i32) -> Result<TranslatedPlan, TranslateError> {
+    let merge = aggregation_node(
+        8,
+        2,
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![
+            merge_aggregate_expr(
+                "avg",
+                scalar_type(TPrimitiveType::DOUBLE),
+                slot_ref(2, state_tuple, scalar_type(TPrimitiveType::VARBINARY)),
+            ),
+            {
+                let mut avg = merge_aggregate_expr(
+                    "avg",
+                    decimal128(38, 8),
+                    slot_ref(3, state_tuple, scalar_type(TPrimitiveType::VARBINARY)),
+                );
+                // The FE names the original argument's type on the merge node too.
+                avg.nodes[0].fn_.as_mut().unwrap().arg_types = vec![decimal64_15_2()];
+                avg
+            },
+            merge_aggregate_expr(
+                "count",
+                scalar_type(TPrimitiveType::BIGINT),
+                slot_ref(4, state_tuple, scalar_type(TPrimitiveType::BIGINT)),
+            ),
+            merge_aggregate_expr(
+                "sum",
+                decimal128(38, 2),
+                slot_ref(5, state_tuple, decimal128(38, 2)),
+            ),
+        ],
+    );
+    translate_with_streams(
+        TPlan::new(vec![merge, exchange_node(7, vec![1])]),
+        two_phase_avg_desc(),
+        &[stream_input(7, names)],
+    )
+}
+
+/// DuckDB name of the column types the tests here use.
+fn duckdb_name(ty: Option<&substrait::proto::Type>) -> String {
+    use substrait::proto::r#type::Kind;
+    match type_kind(ty) {
+        Kind::Varchar(_) => "VARCHAR".to_string(),
+        Kind::I64(_) => "BIGINT".to_string(),
+        Kind::Fp64(_) => "DOUBLE".to_string(),
+        Kind::Decimal(decimal) => format!("DECIMAL({},{})", decimal.precision, decimal.scale),
+        other => panic!("unexpected type {other:?}"),
+    }
+}
+
+/// The name of each measure's function, in order.
+fn measure_names(plan: &substrait::proto::Plan) -> Vec<String> {
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    root_aggregate(plan)
+        .measures
+        .iter()
+        .map(|measure| {
+            let anchor = measure.measure.as_ref().unwrap().function_reference;
+            plan.extensions
+                .iter()
+                .find_map(|declaration| match declaration.mapping_type.as_ref() {
+                    Some(MappingType::ExtensionFunction(function))
+                        if function.function_anchor == anchor =>
+                    {
+                        Some(function.name.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .collect()
+}
+
+/// The input field each measure of the root aggregate reads, looking through a cast; `None`
+/// for a measure without arguments.
+fn measure_fields(plan: &substrait::proto::Plan) -> Vec<Option<i32>> {
+    root_aggregate(plan)
+        .measures
+        .iter()
+        .map(|measure| {
+            let argument = measure.measure.as_ref().unwrap().arguments.first()?;
+            let Some(substrait::proto::function_argument::ArgType::Value(argument)) =
+                &argument.arg_type
+            else {
+                panic!("expected a value argument");
+            };
+            Some(match argument.rex_type.as_ref() {
+                Some(expression::RexType::Cast(cast)) => struct_field(cast.input.as_ref().unwrap()),
+                _ => struct_field(argument),
+            })
+        })
+        .collect()
+}
+
+/// Partial AVG ships two columns, the FP64 sum and then the BIGINT count of its input, so the
+/// columns after it shift by one. An integer input is cast to FP64 before it is summed; a
+/// decimal one is cast by the one-phase lowering already, and isn't cast twice.
+#[test]
+fn two_phase_partial_avg_ships_a_sum_and_a_count() {
+    let plan = translate_partial_avg();
+    assert_eq!(
+        measure_names(&plan.plan),
+        ["sum", "count", "sum", "count", "count", "sum"]
+    );
+    assert_eq!(
+        measure_fields(&plan.plan),
+        [Some(0), Some(0), Some(2), Some(2), None, Some(2)]
+    );
+    let aggregate = root_aggregate(&plan.plan);
+    let argument = |index: usize| match &aggregate.measures[index]
+        .measure
+        .as_ref()
+        .unwrap()
+        .arguments[0]
+        .arg_type
+    {
+        Some(substrait::proto::function_argument::ArgType::Value(argument)) => argument,
+        other => panic!("expected a value argument, got {other:?}"),
+    };
+    // The integer AVG (DOUBLE result) sums its input cast to FP64.
+    for index in 0..2 {
+        let Some(expression::RexType::Cast(cast)) = argument(index).rex_type.as_ref() else {
+            panic!("expected the AVG input cast to FP64");
+        };
+        assert_eq!(duckdb_name(cast.r#type.as_ref()), "DOUBLE");
+    }
+    // The decimal AVG sums its input exactly, as DECIMAL(38,2).
+    for index in 2..4 {
+        assert!(matches!(
+            argument(index).rex_type,
+            Some(expression::RexType::Selection(_))
+        ));
+    }
+    let kinds: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|measure| duckdb_name(measure.measure.as_ref().unwrap().output_type.as_ref()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "DOUBLE",
+            "BIGINT",
+            "DECIMAL(38,2)",
+            "BIGINT",
+            "BIGINT",
+            "DECIMAL(38,2)"
+        ]
+    );
+    // Each AVG's count has no slot of its own, so it is named after its position.
+    assert_eq!(
+        root(&plan.plan).names,
+        [
+            "name",
+            "avg_id",
+            "expr_2",
+            "avg_price",
+            "expr_4",
+            "n",
+            "total"
+        ]
+    );
+}
+
+/// Both fragments derive the exchange row from the same rule, so the partial step's columns
+/// are the merge step's stream, column for column, although the FE types each AVG slot
+/// VARBINARY: an FP64 sum for the integer AVG, an exact DECIMAL(38,2) sum for the decimal one.
+#[test]
+fn two_phase_avg_partial_and_merge_agree_on_the_exchange_row() {
+    let partial = translate_partial_avg();
+    let aggregate = root_aggregate(&partial.plan);
+    let mut emitted = vec!["VARCHAR".to_string()];
+    emitted.extend(
+        aggregate
+            .measures
+            .iter()
+            .map(|measure| duckdb_name(measure.measure.as_ref().unwrap().output_type.as_ref())),
+    );
+    // The decimal SUM ships as DECIMAL(38,2), the FE's own intermediate type.
+    assert_eq!(
+        emitted,
+        [
+            "VARCHAR",
+            "DOUBLE",
+            "BIGINT",
+            "DECIMAL(38,2)",
+            "BIGINT",
+            "BIGINT",
+            "DECIMAL(38,2)"
+        ]
+    );
+
+    let names: Vec<&str> = partial.output_names.iter().map(String::as_str).collect();
+    let merge = translate_merge_avg(&names, 1).unwrap();
+    assert_eq!(stream_types(&merge), emitted);
+}
+
+/// Merge AVG sums the shipped sums and counts and divides; the count sum is cast back to
+/// BIGINT like every two-phase integer sum. An integer AVG divides in FP64; a decimal AVG
+/// divides exactly, to the FE's DECIMAL128(38,8). Each later measure reads its column past the
+/// AVG counts, and the output is the merge's tuple again.
+#[test]
+fn two_phase_merge_avg_divides_the_summed_sums_by_the_summed_counts() {
+    let merge = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4", "c5", "c6"], 1).unwrap();
+    assert_eq!(
+        measure_names(&merge.plan),
+        ["sum", "sum", "sum", "sum", "sum", "sum"]
+    );
+    assert_eq!(measure_fields(&merge.plan), [1, 2, 3, 4, 5, 6].map(Some));
+    assert_eq!(
+        root(&merge.plan).names,
+        ["name", "avg_id", "avg_price", "n", "total"]
+    );
+
+    let Some(rel::RelType::Project(project)) =
+        root(&merge.plan).input.as_ref().unwrap().rel_type.as_ref()
+    else {
+        panic!("expected the projection that finishes the averages");
+    };
+    // name, avg_id, avg_price, n (the count sum cast back to BIGINT), total.
+    assert_eq!(project.expressions.len(), 5);
+    // The integer AVG divides in FP64.
+    let avg_id = &project.expressions[1];
+    let function = scalar_fn(avg_id);
+    assert_eq!(
+        resolved_function(&merge.plan, function.function_reference).1,
+        "divide"
+    );
+    assert_eq!(duckdb_name(function.output_type.as_ref()), "DOUBLE");
+    assert_eq!(struct_field(scalar_arg(avg_id, 0)), 1);
+    // cast(cast(count AS BIGINT) AS DOUBLE)
+    let Some(expression::RexType::Cast(to_double)) = scalar_arg(avg_id, 1).rex_type.as_ref() else {
+        panic!("expected the count cast to FP64");
+    };
+    assert_eq!(duckdb_name(to_double.r#type.as_ref()), "DOUBLE");
+    let Some(expression::RexType::Cast(to_bigint)) =
+        to_double.input.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected the count sum cast back to BIGINT");
+    };
+    assert_eq!(struct_field(to_bigint.input.as_ref().unwrap()), 2);
+    // The decimal AVG divides its exact sum by its count with `sirius_decimal_divide` at the FE's
+    // scale; the function returns the FE's DECIMAL(38,8), so no cast follows.
+    let avg_price = &project.expressions[2];
+    let function = scalar_fn(avg_price);
+    assert_eq!(
+        resolved_function(&merge.plan, function.function_reference).1,
+        "sirius_decimal_divide"
+    );
+    assert_eq!(duckdb_name(function.output_type.as_ref()), "DECIMAL(38,8)");
+    assert_eq!(struct_field(scalar_arg(avg_price, 0)), 3);
+    let Some(expression::RexType::Cast(count_sum)) = scalar_arg(avg_price, 1).rex_type.as_ref()
+    else {
+        panic!("expected the count sum cast back to BIGINT");
+    };
+    assert_eq!(duckdb_name(count_sum.r#type.as_ref()), "BIGINT");
+    assert_eq!(struct_field(count_sum.input.as_ref().unwrap()), 4);
+    assert!(matches!(
+        literal_type(scalar_arg(avg_price, 2)),
+        expression::literal::LiteralType::I32(8)
+    ));
+    let Some(expression::RexType::Cast(count)) = project.expressions[3].rex_type.as_ref() else {
+        panic!("expected the merged count cast back to BIGINT");
+    };
+    assert_eq!(duckdb_name(count.r#type.as_ref()), "BIGINT");
+    let Some(expression::RexType::Cast(total)) = project.expressions[4].rex_type.as_ref() else {
+        panic!("expected the merged decimal sum cast to its FE type");
+    };
+    assert_eq!(duckdb_name(total.r#type.as_ref()), "DECIMAL(38,2)");
+}
+
+/// A sender that shipped one column per slot (no AVG count) doesn't match the exchange row the
+/// merge expects, and the width check says so instead of reading the wrong columns.
+#[test]
+fn two_phase_merge_avg_refuses_a_row_without_the_counts() {
+    let err = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4"], 1).unwrap_err();
+    assert!(err.to_string().contains("has 7 fields"), "{err}");
+}
+
+/// The FE can name a slot through a tuple the row doesn't carry (q16 does); slot refs then
+/// resolve by slot id, as in the BE. The partial states such refs name still widen and retype
+/// the exchange row: matching the refs' tuple against the row's would miss them.
+#[test]
+fn two_phase_merge_avg_reading_states_through_another_tuple_widens_the_exchange_row() {
+    let merge = translate_merge_avg(&["c0", "c1", "c2", "c3", "c4", "c5", "c6"], 3).unwrap();
+    assert_eq!(
+        stream_types(&merge),
+        [
+            "VARCHAR",
+            "DOUBLE",
+            "BIGINT",
+            "DECIMAL(38,2)",
+            "BIGINT",
+            "BIGINT",
+            "DECIMAL(38,2)"
+        ]
+    );
+    assert_eq!(measure_fields(&merge.plan), [1, 2, 3, 4, 5, 6].map(Some));
+}
+
+/// A merge aggregation has to read its partial states from an exchange, the only place the
+/// translator types them.
+#[test]
+fn merge_aggregation_without_an_exchange_child_is_rejected() {
+    let merge = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![merge, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected unsupported plan node, got {err:?}");
+    };
+    assert!(reason.contains("from an exchange"), "{reason}");
 }
 
 /// Builds fragment params whose output sink is a data-stream sink with `partition`.
@@ -4607,59 +5399,199 @@ fn assert_fp64_cast(expr: &substrait::proto::Expression) {
     );
 }
 
-/// Verifies decimal arithmetic is lowered to throwing FP64 casts for the GPU expression
-/// evaluator, and that the result type is FP64 even when the FE result slot stays DECIMAL
-/// (precision <= 18, where `map_type_desc` alone would keep it decimal).
-#[test]
-fn decimal_arithmetic_is_lowered_to_fp64() {
-    for decimal in [
-        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4)),
-        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
-    ] {
-        let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
-        arith.opcode = Some(TExprOpcode::MULTIPLY);
-        let mut nodes = vec![arith];
-        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
-        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+/// Translates `left <opcode> right` as the fragment's only output, both operands slot 1 of
+/// tuple 0 typed `operand`, the node typed `result`, and returns the output expression.
+fn decimal_arithmetic_output(
+    opcode: TExprOpcode,
+    operand: TTypeDesc,
+    result: TTypeDesc,
+) -> substrait::proto::Expression {
+    let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, result, 2);
+    arith.opcode = Some(opcode);
+    let mut nodes = vec![arith];
+    nodes.extend(slot_ref(1, 0, operand.clone()).nodes);
+    nodes.extend(slot_ref(1, 0, operand).nodes);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected output project");
+    };
+    DIVIDE_PLAN.with(|plan| *plan.borrow_mut() = extension_function_names(&translated.plan));
+    project.expressions[0].clone()
+}
 
-        let translated = translate_fragment(&params(
-            Some(TPlan::new(vec![scan_node(0, 0)])),
-            Some(base_desc()),
-            Some(vec![TExpr::new(nodes)]),
-        ))
-        .unwrap();
-        let rel::RelType::Project(project) = root(&translated.plan)
-            .input
-            .as_ref()
-            .unwrap()
-            .rel_type
-            .as_ref()
-            .unwrap()
-        else {
-            panic!("expected output project");
-        };
-        let expression::RexType::ScalarFunction(function) =
-            project.expressions[0].rex_type.as_ref().unwrap()
-        else {
-            panic!("expected arithmetic function");
-        };
-        assert_eq!(function.arguments.len(), 2, "{decimal:?}");
-        for argument in &function.arguments {
-            let substrait::proto::function_argument::ArgType::Value(value) =
-                argument.arg_type.as_ref().unwrap()
-            else {
-                panic!("expected a value argument");
-            };
-            assert_fp64_cast(value);
+thread_local! {
+    /// The extension function names of the last `decimal_arithmetic_output` plan.
+    static DIVIDE_PLAN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The cast an expression is, with its target.
+fn as_cast(expr: &substrait::proto::Expression) -> &expression::Cast {
+    let Some(expression::RexType::Cast(cast)) = expr.rex_type.as_ref() else {
+        panic!("expected a cast, got {expr:?}");
+    };
+    assert_eq!(
+        cast.failure_behavior,
+        expression::cast::FailureBehavior::ThrowException as i32
+    );
+    cast
+}
+
+/// The (precision, scale) of a decimal type.
+fn decimal_of(ty: Option<&substrait::proto::Type>) -> (i32, i32) {
+    let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = ty.unwrap().kind.as_ref() else {
+        panic!("expected a decimal type, got {ty:?}");
+    };
+    (decimal.precision, decimal.scale)
+}
+
+/// The value expression of a scalar function's arguments.
+fn value_arguments(function: &expression::ScalarFunction) -> Vec<&substrait::proto::Expression> {
+    function
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => value,
+            other => panic!("expected a value argument, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Decimal `+` and `-` stay decimal: the operands are passed as they are (the FE has cast them
+/// to the result's precision), and the result is cast to the FE's type.
+#[test]
+fn decimal_add_and_subtract_stay_decimal_and_are_cast_to_the_fe_type() {
+    for opcode in [TExprOpcode::ADD, TExprOpcode::SUBTRACT] {
+        let output = decimal_arithmetic_output(
+            opcode,
+            scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(16), Some(2)),
+            scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(16), Some(2)),
+        );
+        let cast = as_cast(&output);
+        assert_eq!(decimal_of(cast.r#type.as_ref()), (16, 2), "{opcode:?}");
+        for value in value_arguments(scalar_fn(cast.input.as_ref().unwrap())) {
+            assert!(
+                matches!(value.rex_type, Some(expression::RexType::Selection(_))),
+                "{opcode:?}: operand {value:?}"
+            );
         }
+    }
+}
+
+/// A decimal product the FE types wider than 18 digits (revenue's DECIMAL128(31,4)) is computed
+/// in DECIMAL128: each operand is widened to DECIMAL(38) at its own scale, because DuckDB would
+/// compute DECIMAL(15,2) * DECIMAL(16,2) in 64 bits as DECIMAL(18,4), where the GPU wraps past
+/// 10^18. The product is then cast to the FE's type.
+#[test]
+fn a_wide_decimal_product_is_computed_in_decimal128() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::MULTIPLY,
+        decimal64_15_2(),
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4)),
+    );
+    let cast = as_cast(&output);
+    assert_eq!(decimal_of(cast.r#type.as_ref()), (31, 4));
+    for value in value_arguments(scalar_fn(cast.input.as_ref().unwrap())) {
+        let widened = as_cast(value);
+        assert_eq!(decimal_of(widened.r#type.as_ref()), (38, 2));
+        assert!(matches!(
+            widened.input.as_ref().unwrap().rex_type,
+            Some(expression::RexType::Selection(_))
+        ));
+    }
+}
+
+/// A decimal product the FE keeps within 18 digits is computed as DuckDB binds it.
+#[test]
+fn a_narrow_decimal_product_is_not_widened() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::MULTIPLY,
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(9), Some(2)),
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(4)),
+    );
+    let cast = as_cast(&output);
+    assert_eq!(decimal_of(cast.r#type.as_ref()), (18, 4));
+    for value in value_arguments(scalar_fn(cast.input.as_ref().unwrap())) {
+        assert!(matches!(
+            value.rex_type,
+            Some(expression::RexType::Selection(_))
+        ));
+    }
+}
+
+/// Decimal `/` is exact: `sirius_decimal_divide(dividend, divisor, scale)` at the FE's result
+/// scale, with the operands as they are. It returns DECIMAL(38, scale), the FE's type, so no
+/// cast follows. It rounds half away from zero and gives NULL for a zero divisor, as StarRocks'
+/// division does.
+#[test]
+fn decimal_division_is_sirius_decimal_divide() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::DIVIDE,
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(10)),
+    );
+    let function = scalar_fn(&output);
+    let plan_names = DIVIDE_PLAN.with(|plan| plan.borrow().clone());
+    assert!(
+        plan_names.contains(&"sirius_decimal_divide".to_string()),
+        "{plan_names:?}"
+    );
+    assert_eq!(decimal_of(function.output_type.as_ref()), (38, 10));
+    let arguments = value_arguments(function);
+    assert_eq!(arguments.len(), 3);
+    for operand in &arguments[..2] {
         assert!(
-            matches!(
-                function.output_type.as_ref().unwrap().kind,
-                Some(substrait::proto::r#type::Kind::Fp64(_))
-            ),
-            "{decimal:?}"
+            matches!(operand.rex_type, Some(expression::RexType::Selection(_))),
+            "{operand:?}"
         );
     }
+    assert!(matches!(
+        literal_type(arguments[2]),
+        expression::literal::LiteralType::I32(10)
+    ));
+}
+
+/// A decimal MOD stays in FP64, with a zero divisor giving NULL, as in StarRocks, rather than
+/// the NaN that the cast to the decimal result type would refuse.
+#[test]
+fn a_zero_decimal_modulus_divisor_gives_null() {
+    let output = decimal_arithmetic_output(
+        TExprOpcode::MOD,
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(4)),
+    );
+    let cast = as_cast(&output);
+    assert_eq!(decimal_of(cast.r#type.as_ref()), (38, 4));
+    let function = scalar_fn(cast.input.as_ref().unwrap());
+    assert!(matches!(
+        function.output_type.as_ref().unwrap().kind,
+        Some(substrait::proto::r#type::Kind::Fp64(_))
+    ));
+    let divisor = value_arguments(function)[1];
+    let Some(expression::RexType::IfThen(guard)) = divisor.rex_type.as_ref() else {
+        panic!("expected the divisor guarded against zero, got {divisor:?}");
+    };
+    let condition = guard.ifs[0].r#if.as_ref().unwrap();
+    assert_fp64_cast(scalar_arg(condition, 0));
+    assert!(matches!(
+        literal_type(scalar_arg(condition, 1)),
+        expression::literal::LiteralType::Fp64(zero) if *zero == 0.0
+    ));
+    assert!(matches!(
+        literal_type(guard.ifs[0].then.as_ref().unwrap()),
+        expression::literal::LiteralType::Null(_)
+    ));
 }
 
 /// Translates a one-phase aggregation with one measure over a BIGINT slot and returns that
@@ -4702,23 +5634,79 @@ fn single_measure_argument(name: &str, ret_type: TTypeDesc) -> substrait::proto:
     value.clone()
 }
 
-/// Verifies a decimal AVG argument is lowered to a throwing FP64 cast for GPU execution.
+/// A one-phase decimal AVG is StarRocks' exact average: the DECIMAL(38,2) sum and the count of
+/// its argument, divided by `sirius_decimal_divide` at the FE's scale, DECIMAL128(38,8).
+/// DuckDB's avg(DECIMAL) would return DOUBLE.
 #[test]
-fn decimal_avg_is_lowered_to_fp64() {
-    assert_fp64_cast(&single_measure_argument(
-        "avg",
-        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(8)),
+fn a_one_phase_decimal_avg_divides_its_exact_sum_by_its_count() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "avg",
+            decimal128(38, 8),
+            Some(slot_ref(3, 0, decimal64_15_2())),
+        )],
+    );
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "price", decimal64_15_2()),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "avg_price", decimal128(38, 8)),
+        ],
+    );
+    let plan = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(measure_names(&plan.plan), ["sum", "count"]);
+    let aggregate = root_aggregate(&plan.plan);
+    assert_eq!(
+        decimal_of(
+            aggregate.measures[0]
+                .measure
+                .as_ref()
+                .unwrap()
+                .output_type
+                .as_ref()
+        ),
+        (38, 2)
+    );
+    assert_eq!(root(&plan.plan).names, ["name", "avg_price"]);
+    let Some(rel::RelType::Project(project)) =
+        root(&plan.plan).input.as_ref().unwrap().rel_type.as_ref()
+    else {
+        panic!("expected the projection that finishes the average");
+    };
+    let quotient = scalar_fn(&project.expressions[1]);
+    assert_eq!(
+        resolved_function(&plan.plan, quotient.function_reference).1,
+        "sirius_decimal_divide"
+    );
+    assert_eq!(decimal_of(quotient.output_type.as_ref()), (38, 8));
+    assert!(matches!(
+        literal_type(scalar_arg(&project.expressions[1], 2)),
+        expression::literal::LiteralType::I32(8)
     ));
 }
 
-/// Verifies a decimal SUM argument is lowered the same way, including when the FE result slot
-/// stays DECIMAL (precision <= 18).
+/// A decimal SUM stays decimal: its argument is passed as it is.
 #[test]
-fn decimal_sum_is_lowered_to_fp64() {
-    assert_fp64_cast(&single_measure_argument(
+fn decimal_sum_argument_stays_decimal() {
+    let argument = single_measure_argument(
         "sum",
-        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
-    ));
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+    );
+    assert!(
+        matches!(argument.rex_type, Some(expression::RexType::Selection(_))),
+        "{argument:?}"
+    );
 }
 
 /// Verifies an avg that lowers to neither the DOUBLE nor the decimal path (temporal avg, with
@@ -5147,6 +6135,115 @@ fn each_aggregate_takes_its_own_output_slot() {
     let names = extension_function_names(&translated.plan);
     assert!(names.contains(&"sum".to_string()), "{names:?}");
     assert!(names.contains(&"count".to_string()), "{names:?}");
+}
+
+/// Descriptor for an aggregation with separate tuples: scan tuple 0 (`id`, `name`, `price`),
+/// output tuple 1 (`name`, `n`, `top`) and intermediate tuple 2, whose wire order (`name` slot
+/// 7, `n_state` slot 5, `top_state` slot 6) is not its slot-id order.
+fn split_tuple_agg_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None), (2, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "price", decimal64_15_2()),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "n", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, "top", decimal64_15_2()),
+            slot(7, 2, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(5, 2, "n_state", scalar_type(TPrimitiveType::BIGINT)),
+            slot(6, 2, "top_state", decimal64_15_2()),
+        ],
+    )
+}
+
+/// Translates `count(*), max(price) GROUP BY name` over [`split_tuple_agg_desc`], hash-sending
+/// its output on `partition`. A node that doesn't finalize emits tuple 2, like the FE's
+/// `setIntermediateTuple`.
+fn translate_split_tuple_aggregation(
+    need_finalize: bool,
+    partition: Vec<TExpr>,
+) -> Result<TranslatedPlan, TranslateError> {
+    let mut agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![
+            aggregate_expr("count", scalar_type(TPrimitiveType::BIGINT), None),
+            aggregate_expr(
+                "max",
+                decimal64_15_2(),
+                Some(slot_ref(3, 0, decimal64_15_2())),
+            ),
+        ],
+    );
+    let agg_node = agg.agg_node.as_mut().unwrap();
+    agg_node.intermediate_tuple_id = 2;
+    agg_node.need_finalize = need_finalize;
+    if !need_finalize {
+        agg.row_tuples = vec![2];
+    }
+    translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![agg, scan_node(0, 0)]),
+        split_tuple_agg_desc(),
+        TDataPartition::new(
+            TPartitionType::HASH_PARTITIONED,
+            Some(partition),
+            None,
+            None,
+        ),
+    ))
+}
+
+/// The FE's column-order contract for a non-finalizing aggregation: grouping key i is slot i of
+/// its intermediate tuple and aggregate i slot `keys + i`, counted in descriptor order. The
+/// partition keys name the intermediate tuple's slots in reverse, so they resolve to the
+/// columns the contract assigns them; by slot id they would resolve to `[1, 0, 2]`.
+#[test]
+fn non_finalizing_aggregation_emits_its_intermediate_tuple_in_descriptor_order() {
+    let plan = translate_split_tuple_aggregation(
+        false,
+        vec![
+            slot_ref(6, 2, decimal64_15_2()),
+            slot_ref(5, 2, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(7, 2, scalar_type(TPrimitiveType::VARCHAR)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(root(&plan.plan).names, ["name", "n_state", "top_state"]);
+    assert_eq!(plan.output_partition_columns, Some(vec![2, 1, 0]));
+    // Aggregate i is column `keys + i`: the count, then the maximum.
+    let aggregate = root_aggregate(&plan.plan);
+    let kinds: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|measure| type_kind(measure.measure.as_ref().unwrap().output_type.as_ref()))
+        .collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                substrait::proto::r#type::Kind::I64(_),
+                substrait::proto::r#type::Kind::Decimal(_)
+            ]
+        ),
+        "{kinds:?}"
+    );
+}
+
+/// A finalizing aggregation with a separate intermediate tuple still emits its output tuple.
+#[test]
+fn finalizing_aggregation_emits_its_output_tuple() {
+    let plan = translate_split_tuple_aggregation(
+        true,
+        vec![
+            slot_ref(3, 1, decimal64_15_2()),
+            slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(root(&plan.plan).names, ["name", "n", "top"]);
+    assert_eq!(plan.output_partition_columns, Some(vec![2, 1]));
 }
 
 /// Builds a SORT_NODE over sort tuple 1 carrying `limit` and `offset`, sorting on the single
@@ -5686,5 +6783,912 @@ fn execute_same_type_aggregate_sort_and_project_outputs() {
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A broadcast join filter `filter_id` on `build_key`, targeting scan `target` through `probe`.
+fn runtime_filter(
+    filter_id: i32,
+    build_key: TExpr,
+    target: i32,
+    probe: TExpr,
+    mode: starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode,
+) -> starrocks_thrift::runtime_filter::TRuntimeFilterDescription {
+    starrocks_thrift::runtime_filter::TRuntimeFilterDescription {
+        filter_id: Some(filter_id),
+        build_expr: Some(build_key),
+        plan_node_id_to_target_expr: Some(BTreeMap::from([(target, probe)])),
+        build_join_mode: Some(mode),
+        build_plan_node_id: Some(2),
+        ..Default::default()
+    }
+}
+
+/// A scan of tuple 0 (`a`) probing broadcast filter 7 on `a`.
+fn probing_scan_params() -> TExecPlanFragmentParams {
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![runtime_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::BROADCAST,
+    )]);
+    params(Some(TPlan::new(vec![scan])), Some(join_desc()), None)
+}
+
+fn key_stream(ty: &str) -> starrocks_plan_translator::runtime_filter::FilterInput {
+    starrocks_plan_translator::runtime_filter::FilterInput {
+        filter_id: 7,
+        keys: starrocks_plan_translator::runtime_filter::ProbeKeys::Stream {
+            node_id: 1_000_007,
+            stream_view: "sirius_stream_1000007".to_string(),
+            column: starrocks_plan_translator::StreamInputColumn {
+                name: "rf_key".to_string(),
+                ty: ty.to_string(),
+            },
+        },
+    }
+}
+
+fn key_range(min: i64, max: i64) -> starrocks_plan_translator::runtime_filter::FilterInput {
+    starrocks_plan_translator::runtime_filter::FilterInput {
+        filter_id: 7,
+        keys: starrocks_plan_translator::runtime_filter::ProbeKeys::Range { min, max },
+    }
+}
+
+/// The FE's merge node of the partitioned filters below.
+fn merge_node() -> starrocks_thrift::types::TNetworkAddress {
+    starrocks_thrift::types::TNetworkAddress::new("10.0.0.2".to_string(), 8060)
+}
+
+/// `runtime_filter`, from a partitioned join with `merge_node` and `instances` build instances.
+fn partitioned_filter(
+    filter_id: i32,
+    build_key: TExpr,
+    target: i32,
+    probe: TExpr,
+    instances: i32,
+) -> starrocks_thrift::runtime_filter::TRuntimeFilterDescription {
+    let mut filter = runtime_filter(
+        filter_id,
+        build_key,
+        target,
+        probe,
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED,
+    );
+    filter.runtime_filter_merge_nodes = Some(vec![merge_node()]);
+    filter.layout = Some(starrocks_thrift::runtime_filter::TRuntimeFilterLayout {
+        filter_id: Some(filter_id),
+        num_instances: Some(instances),
+        ..Default::default()
+    });
+    filter
+}
+
+#[test]
+fn a_scan_reports_the_runtime_filters_it_probes() {
+    let probed = starrocks_plan_translator::runtime_filter::probed_filters(&probing_scan_params());
+    assert_eq!(
+        probed,
+        vec![starrocks_plan_translator::runtime_filter::ProbedFilter {
+            filter_id: 7,
+            scan_node_id: 0,
+            distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Broadcast,
+            merge_node: None,
+            shares: None,
+            key_type: Some("BIGINT".to_string()),
+        }]
+    );
+    let plain = params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(join_desc()),
+        None,
+    );
+    assert!(starrocks_plan_translator::runtime_filter::probed_filters(&plain).is_empty());
+}
+
+#[test]
+fn a_bound_runtime_filter_semi_joins_the_scan_with_its_key_stream() {
+    let params = probing_scan_params();
+    let unfiltered = PlanTranslator::new().translate_fragment(&params).unwrap();
+    let filtered = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_stream("BIGINT")])
+        .unwrap();
+    // Same output; the key stream is declared for the engine.
+    assert_eq!(filtered.output_names, unfiltered.output_names);
+    assert_eq!(filtered.stream_inputs.len(), 1);
+    assert_eq!(filtered.stream_inputs[0].node_id, 1_000_007);
+    assert_eq!(filtered.stream_inputs[0].columns[0].ty, "BIGINT");
+    let rel::RelType::Join(join) = root(&filtered.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the scan under a semi join");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::LeftSemi as i32
+    );
+    let rel::RelType::Read(keys) = join.right.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the key stream read on the right");
+    };
+    assert!(matches!(
+        keys.read_type.as_ref().unwrap(),
+        read_rel::ReadType::NamedTable(table) if table.names == ["sirius_stream_1000007"]
+    ));
+    let Some(expression::RexType::ScalarFunction(equal)) =
+        join.expression.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected an equality condition");
+    };
+    // `a` of the scan against the key, past the scan's one column.
+    assert_eq!(argument_field_indices(equal), vec![0, 1]);
+
+    // A filter bound to no scan of the fragment changes nothing.
+    let mut other = key_stream("BIGINT");
+    other.filter_id = 8;
+    let mut other_range = key_range(1, 2);
+    other_range.filter_id = 8;
+    let untouched = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[other, other_range])
+        .unwrap();
+    assert!(untouched.stream_inputs.is_empty());
+    assert_eq!(untouched.plan, unfiltered.plan);
+}
+
+#[test]
+fn a_key_stream_of_another_type_is_refused() {
+    let err = PlanTranslator::new()
+        .translate_fragment_with_inputs(&probing_scan_params(), &[], &[key_stream("INTEGER")])
+        .unwrap_err();
+    assert!(err.to_string().contains("probes a BIGINT key"), "{err}");
+}
+
+#[test]
+fn a_broadcast_join_reports_the_filters_it_builds_from_its_exchange() {
+    // Probe exchange 0 (tuple 0: `a`) joined to build exchange 1 (tuple 1: `b`).
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let filter = |id, mode| {
+        runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            mode,
+        )
+    };
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        filter(7, Mode::BROADCAST),
+        // A colocate join's build side isn't an exchange the CN can read.
+        filter(8, Mode::COLOCATE),
+    ]);
+    let plan = TPlan::new(vec![
+        join,
+        exchange_node(10, vec![0]),
+        exchange_node(11, vec![1]),
+    ]);
+    let built = starrocks_plan_translator::runtime_filter::built_filters(&params(
+        Some(plan),
+        Some(join_desc()),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(
+        built,
+        vec![starrocks_plan_translator::runtime_filter::BuiltFilter {
+            filter_id: 7,
+            join_node_id: 2,
+            exchange_node_id: 11,
+            column: 0,
+            column_type: "BIGINT".to_string(),
+            distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Broadcast,
+            merge_node: None,
+            served_by: None,
+        }]
+    );
+}
+
+/// A broadcast join with filter 7 on its first key, over probe exchange 10 and build exchange 11.
+fn join_building_filter_7(
+    configure: impl FnOnce(
+        &mut starrocks_thrift::plan_nodes::THashJoinNode,
+        &mut starrocks_thrift::runtime_filter::TRuntimeFilterDescription,
+    ),
+) -> Vec<starrocks_plan_translator::runtime_filter::BuiltFilter> {
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let mut filter = runtime_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::BROADCAST,
+    );
+    filter.expr_order = Some(0);
+    let hash_join = join.hash_join_node.as_mut().unwrap();
+    configure(hash_join, &mut filter);
+    hash_join.build_runtime_filters = Some(vec![filter]);
+    let plan = TPlan::new(vec![
+        join,
+        exchange_node(10, vec![0]),
+        exchange_node(11, vec![1]),
+    ]);
+    starrocks_plan_translator::runtime_filter::built_filters(&params(
+        Some(plan),
+        Some(join_desc()),
+        None,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn a_filter_on_a_null_safe_join_key_is_not_built() {
+    // `=` keeps the filter.
+    assert_eq!(join_building_filter_7(|_, _| {}).len(), 1);
+    // `<=>` matches NULL keys, which the semi-join rewrite would drop.
+    let null_safe = join_building_filter_7(|join, _| {
+        join.eq_join_conjuncts[0].opcode = Some(TExprOpcode::EQ_FOR_NULL);
+    });
+    assert!(null_safe.is_empty(), "{null_safe:?}");
+    // Without `expr_order`, any null-safe condition refuses it.
+    let unordered = join_building_filter_7(|join, filter| {
+        join.eq_join_conjuncts[0].opcode = Some(TExprOpcode::EQ_FOR_NULL);
+        filter.expr_order = None;
+    });
+    assert!(unordered.is_empty(), "{unordered:?}");
+    // An `expr_order` past the join's conditions can't be checked, so it's refused too.
+    let unknown = join_building_filter_7(|_, filter| filter.expr_order = Some(3));
+    assert!(unknown.is_empty(), "{unknown:?}");
+}
+
+#[test]
+fn a_skew_joins_broadcast_branch_filter_is_not_built() {
+    let skew = join_building_filter_7(|_, filter| {
+        filter.is_broad_cast_join_in_skew = Some(true);
+    });
+    assert!(skew.is_empty(), "{skew:?}");
+    let plain = join_building_filter_7(|_, filter| {
+        filter.is_broad_cast_join_in_skew = Some(false);
+    });
+    assert_eq!(plain.len(), 1);
+}
+
+#[test]
+fn filters_a_join_cant_build_are_reported_with_their_reason() {
+    use starrocks_plan_translator::runtime_filter::{SkipReason, SkippedFilter, skipped_builds};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let filter = |id, mode| {
+        let mut filter = runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            mode,
+        );
+        filter.expr_order = Some(0);
+        filter
+    };
+    let mut skew = filter(9, Mode::BROADCAST);
+    skew.is_broad_cast_join_in_skew = Some(true);
+    let mut expression_key = filter(10, Mode::BROADCAST);
+    expression_key.build_expr = Some(arithmetic(
+        TExprOpcode::ADD,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+    ));
+    // A partitioned join's filter needs the merge node to find its probers.
+    let mut unmerged = filter(11, Mode::PARTITIONED);
+    unmerged.runtime_filter_merge_nodes = Some(Vec::new());
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        filter(7, Mode::BROADCAST),
+        filter(8, Mode::COLOCATE),
+        skew,
+        expression_key,
+        unmerged,
+    ]);
+    let plan = |join| {
+        params(
+            Some(TPlan::new(vec![
+                join,
+                exchange_node(10, vec![0]),
+                exchange_node(11, vec![1]),
+            ])),
+            Some(join_desc()),
+            None,
+        )
+    };
+    let skipped = |id, reason| SkippedFilter {
+        filter_id: id,
+        node_id: 2,
+        reason,
+    };
+    assert_eq!(
+        skipped_builds(&plan(join.clone())).unwrap(),
+        vec![
+            skipped(8, SkipReason::NotBroadcast),
+            skipped(9, SkipReason::Skew),
+            skipped(10, SkipReason::KeyNotSlot),
+            skipped(11, SkipReason::NoMergeNode),
+        ]
+    );
+    // Every filter of a null-safe key is reported as such.
+    join.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].opcode =
+        Some(TExprOpcode::EQ_FOR_NULL);
+    assert!(
+        skipped_builds(&plan(join))
+            .unwrap()
+            .contains(&skipped(7, SkipReason::NullSafe))
+    );
+}
+
+#[test]
+fn partitioned_filters_a_join_cant_build_name_their_merge_node() {
+    use starrocks_plan_translator::runtime_filter::{SkipReason, UnbuiltShare, unbuilt_shares};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let filter = |id, mode| {
+        let mut filter = runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            mode,
+        );
+        filter.expr_order = Some(0);
+        filter.runtime_filter_merge_nodes = Some(vec![merge_node()]);
+        filter
+    };
+    let mut unmerged = filter(3, Mode::PARTITIONED);
+    unmerged.runtime_filter_merge_nodes = Some(Vec::new());
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        filter(1, Mode::PARTITIONED),
+        filter(2, Mode::BROADCAST),
+        unmerged,
+    ]);
+    let plan = |build| {
+        params(
+            Some(TPlan::new(vec![
+                join.clone(),
+                exchange_node(10, vec![0]),
+                build,
+            ])),
+            Some(join_desc()),
+            None,
+        )
+    };
+    // Built from an exchange: nothing to tell anyone.
+    assert_eq!(
+        unbuilt_shares(&plan(exchange_node(11, vec![1]))).unwrap(),
+        Vec::new()
+    );
+    // Built from another join's output, as q17's filter 1 is once the FE plans it: only the
+    // partitioned filter with a merge node is listed. A broadcast filter's probers are on the
+    // builder's CN and don't wait for it.
+    let mut build_join = hash_join_node(TJoinOp::INNER_JOIN);
+    build_join.node_id = 11;
+    build_join.num_children = 0;
+    build_join
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .build_runtime_filters = None;
+    assert_eq!(
+        unbuilt_shares(&plan(build_join)).unwrap(),
+        vec![UnbuiltShare {
+            filter_id: 1,
+            join_node_id: 2,
+            merge_node: merge_node(),
+            reason: SkipReason::BuildNotExchange,
+        }]
+    );
+}
+
+/// q17's shape: join 2 builds partitioned filter 1 on `b` from the output of join 11, which
+/// builds partitioned filter 0 on `b` from exchange 12. `between` sits between the two joins.
+fn served_filter_plan(
+    between: Option<TPlanNode>,
+    top_filter: impl FnOnce(&mut TPlanNode),
+) -> TExecPlanFragmentParams {
+    let filter = |id| {
+        let mut filter = partitioned_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            4,
+        );
+        filter.expr_order = Some(0);
+        filter
+    };
+    let mut top = hash_join_node(TJoinOp::INNER_JOIN);
+    top.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![filter(1)]);
+    top_filter(&mut top);
+    let mut below = hash_join_node(TJoinOp::INNER_JOIN);
+    below.node_id = 11;
+    below.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![filter(0)]);
+    let mut nodes = vec![top, exchange_node(10, vec![0])];
+    nodes.extend(between);
+    nodes.extend([
+        below,
+        exchange_node(13, vec![0]),
+        exchange_node(12, vec![1]),
+    ]);
+    params(Some(TPlan::new(nodes)), Some(join_desc()), None)
+}
+
+/// A projection of slot 1 (`b`) to `expr`.
+fn projection_of_b(expr: TExpr) -> TPlanNode {
+    let mut project = base_plan_node(20, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(starrocks_thrift::plan_nodes::TProjectNode {
+        slot_map: Some(BTreeMap::from([(1, expr)])),
+        common_slot_map: None,
+    });
+    project
+}
+
+#[test]
+fn a_filter_built_on_a_joins_output_is_served_by_the_exchange_its_keys_came_through() {
+    use starrocks_plan_translator::runtime_filter::{
+        BuildDistribution, BuiltFilter, SkipReason, built_filters, skipped_builds, unbuilt_shares,
+    };
+    let served = |plan: &TExecPlanFragmentParams| {
+        built_filters(plan)
+            .unwrap()
+            .into_iter()
+            .find(|built| built.filter_id == 1)
+    };
+    let b = || slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT));
+
+    // Filter 1 reads filter 0's exchange, column and key type.
+    let plan = served_filter_plan(None, |_| {});
+    let filter_0 = BuiltFilter {
+        filter_id: 0,
+        join_node_id: 11,
+        exchange_node_id: 12,
+        column: 0,
+        column_type: "BIGINT".to_string(),
+        distribution: BuildDistribution::Partitioned,
+        merge_node: Some(merge_node()),
+        served_by: None,
+    };
+    assert_eq!(
+        built_filters(&plan).unwrap(),
+        vec![
+            BuiltFilter {
+                filter_id: 1,
+                join_node_id: 2,
+                served_by: Some(0),
+                ..filter_0.clone()
+            },
+            filter_0,
+        ]
+    );
+    // It is neither reported skipped nor released.
+    assert_eq!(skipped_builds(&plan).unwrap(), Vec::new());
+    assert_eq!(unbuilt_shares(&plan).unwrap(), Vec::new());
+
+    // A filter or a projection passing `b` on unchanged keeps it served.
+    let filter_node = base_plan_node(20, TPlanNodeType::SELECT_NODE, 1, vec![1]);
+    assert!(served(&served_filter_plan(Some(filter_node), |_| {})).is_some());
+    assert!(served(&served_filter_plan(Some(projection_of_b(b())), |_| {})).is_some());
+
+    // Anything that may make new values of `b` in between, a different key, a null-safe or
+    // broadcast join: not served, and released as before.
+    let computed = arithmetic(TExprOpcode::ADD, b(), b());
+    let aggregation = base_plan_node(20, TPlanNodeType::AGGREGATION_NODE, 1, vec![1]);
+    let other_key = |top: &mut TPlanNode| {
+        top.hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .build_expr = Some(slot_ref(7, 1, scalar_type(TPrimitiveType::BIGINT)));
+    };
+    let null_safe = |top: &mut TPlanNode| {
+        top.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].opcode =
+            Some(TExprOpcode::EQ_FOR_NULL);
+    };
+    let broadcast = |top: &mut TPlanNode| {
+        top.hash_join_node
+            .as_mut()
+            .unwrap()
+            .build_runtime_filters
+            .as_mut()
+            .unwrap()[0]
+            .build_join_mode =
+            Some(starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::BROADCAST);
+    };
+    // A projection that also lists `b` among its common slots may compute it.
+    let mut common = projection_of_b(b());
+    common.project_node.as_mut().unwrap().common_slot_map = Some(BTreeMap::from([(1, b())]));
+    let not_served = [
+        served_filter_plan(Some(projection_of_b(computed)), |_| {}),
+        served_filter_plan(Some(common), |_| {}),
+        served_filter_plan(Some(aggregation), |_| {}),
+        served_filter_plan(None, other_key),
+        served_filter_plan(None, null_safe),
+        served_filter_plan(None, broadcast),
+    ];
+    for (case, plan) in not_served.iter().enumerate() {
+        assert_eq!(served(plan), None, "case {case}");
+        assert!(
+            skipped_builds(plan)
+                .unwrap()
+                .iter()
+                .any(|skip| skip.filter_id == 1 && skip.reason == SkipReason::BuildNotExchange),
+        );
+    }
+    assert_eq!(unbuilt_shares(&not_served[2]).unwrap()[0].filter_id, 1);
+}
+
+#[test]
+fn probes_no_compute_node_filters_are_reported_and_the_rest_are_probed() {
+    use starrocks_plan_translator::runtime_filter::{SkipReason, SkippedFilter, skipped_probes};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let probe = |id| {
+        runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            Mode::BROADCAST,
+        )
+    };
+    // The join's probe side is a scan probing filter 7, which the join builds, and filter 8,
+    // built elsewhere. The build exchange is a target of filter 7 too.
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![probe(7)]);
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![probe(7), probe(8)]);
+    let mut build = exchange_node(11, vec![1]);
+    build.probe_runtime_filters = Some(vec![probe(7)]);
+    let fragment = params(
+        Some(TPlan::new(vec![join, scan, build])),
+        Some(join_desc()),
+        None,
+    );
+    let skipped = |filter_id, node_id, reason| SkippedFilter {
+        filter_id,
+        node_id,
+        reason,
+    };
+    assert_eq!(
+        skipped_probes(&fragment),
+        vec![
+            skipped(7, 0, SkipReason::SameFragment),
+            skipped(7, 11, SkipReason::TargetNotScan),
+        ]
+    );
+    // Filter 8, built in another fragment, is decided when this one runs, as a leaf scan's are.
+    assert_eq!(
+        starrocks_plan_translator::runtime_filter::probed_filters(&fragment)
+            .iter()
+            .map(|probe| (probe.filter_id, probe.scan_node_id))
+            .collect::<Vec<_>>(),
+        vec![(8, 0)]
+    );
+    assert!(skipped_probes(&probing_scan_params()).is_empty());
+}
+
+#[test]
+fn a_partitioned_join_reports_the_share_each_instance_builds() {
+    use starrocks_plan_translator::runtime_filter::{BuildDistribution, BuiltFilter};
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let mut bucket = partitioned_filter(
+        8,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        4,
+    );
+    // A bucket-shuffle join spreads its build side by the probe side's buckets: shares too.
+    bucket.build_join_mode = Some(Mode::SHUFFLE_HASH_BUCKET);
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        partitioned_filter(
+            7,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            4,
+        ),
+        bucket,
+    ]);
+    let plan = TPlan::new(vec![
+        join,
+        exchange_node(10, vec![0]),
+        exchange_node(11, vec![1]),
+    ]);
+    let built = starrocks_plan_translator::runtime_filter::built_filters(&params(
+        Some(plan),
+        Some(join_desc()),
+        None,
+    ))
+    .unwrap();
+    let share = |filter_id| BuiltFilter {
+        filter_id,
+        join_node_id: 2,
+        exchange_node_id: 11,
+        column: 0,
+        column_type: "BIGINT".to_string(),
+        distribution: BuildDistribution::Partitioned,
+        merge_node: Some(merge_node()),
+        served_by: None,
+    };
+    assert_eq!(built, vec![share(7), share(8)]);
+}
+
+#[test]
+fn a_scan_reports_where_a_partitioned_filters_shares_meet() {
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![partitioned_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        4,
+    )]);
+    let probed = starrocks_plan_translator::runtime_filter::probed_filters(&params(
+        Some(TPlan::new(vec![scan])),
+        Some(join_desc()),
+        None,
+    ));
+    assert_eq!(
+        probed,
+        vec![starrocks_plan_translator::runtime_filter::ProbedFilter {
+            filter_id: 7,
+            scan_node_id: 0,
+            distribution: starrocks_plan_translator::runtime_filter::BuildDistribution::Partitioned,
+            merge_node: Some(merge_node()),
+            shares: Some(4),
+            key_type: Some("BIGINT".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn a_range_bound_runtime_filter_keeps_the_keys_between_its_bounds() {
+    let params = probing_scan_params();
+    let unfiltered = PlanTranslator::new().translate_fragment(&params).unwrap();
+    let filtered = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_range(-5, 1 << 40)])
+        .unwrap();
+    assert_eq!(filtered.output_names, unfiltered.output_names);
+    assert!(filtered.stream_inputs.is_empty(), "bounds read no stream");
+    let rel::RelType::Filter(filter) = root(&filtered.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the scan under a filter");
+    };
+    assert!(matches!(
+        filter.input.as_ref().unwrap().rel_type.as_ref().unwrap(),
+        rel::RelType::Read(_)
+    ));
+    let Some(expression::RexType::ScalarFunction(and)) =
+        filter.condition.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected a conjunction");
+    };
+    // `a >= -5 AND a <= 2^40`, with BIGINT literals for the BIGINT key.
+    let bounds: Vec<(u32, Vec<i32>, i64)> = and
+        .arguments
+        .iter()
+        .map(|argument| {
+            let Some(substrait::proto::function_argument::ArgType::Value(value)) =
+                argument.arg_type.as_ref()
+            else {
+                panic!("expected a value argument");
+            };
+            let Some(expression::RexType::ScalarFunction(compare)) = value.rex_type.as_ref() else {
+                panic!("expected a comparison");
+            };
+            let [
+                substrait::proto::FunctionArgument {
+                    arg_type: Some(substrait::proto::function_argument::ArgType::Value(key)),
+                },
+                substrait::proto::FunctionArgument {
+                    arg_type: Some(substrait::proto::function_argument::ArgType::Value(literal)),
+                },
+            ] = compare.arguments.as_slice()
+            else {
+                panic!("expected a key and a bound");
+            };
+            let Some(expression::RexType::Literal(expression::Literal {
+                literal_type: Some(expression::literal::LiteralType::I64(bound)),
+                ..
+            })) = literal.rex_type.as_ref()
+            else {
+                panic!("expected a BIGINT literal: {literal:?}");
+            };
+            (compare.function_reference, vec![field_index(key)], *bound)
+        })
+        .collect();
+    assert_eq!(
+        bounds
+            .into_iter()
+            .map(|(anchor, fields, bound)| (function_name(&filtered.plan, anchor), fields, bound))
+            .collect::<Vec<_>>(),
+        vec![
+            ("gte".to_string(), vec![0], -5),
+            ("lte".to_string(), vec![0], 1 << 40)
+        ]
+    );
+}
+
+#[test]
+fn a_range_bound_that_overflows_the_key_type_is_refused() {
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![runtime_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::INT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::INT)),
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED,
+    )]);
+    let params = params(Some(TPlan::new(vec![scan])), Some(join_desc()), None);
+    PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_range(1, 1 << 20)])
+        .unwrap();
+    let err = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_range(1, 1 << 40)])
+        .unwrap_err();
+    assert!(err.to_string().contains("does not fit"), "{err}");
+}
+
+/// The key stream a share plan reads.
+fn share_stream(ty: &str) -> starrocks_plan_translator::StreamInputSchema {
+    starrocks_plan_translator::StreamInputSchema {
+        node_id: 1_000_007,
+        stream_view: "sirius_stream_1000007".to_string(),
+        columns: vec![starrocks_plan_translator::StreamInputColumn {
+            name: "rf_key".to_string(),
+            ty: ty.to_string(),
+        }],
+    }
+}
+
+/// The share plan's distinct keys: the aggregate at its root, and the filter under it.
+fn share_parts(
+    plan: &starrocks_plan_translator::TranslatedPlan,
+) -> (
+    &substrait::proto::AggregateRel,
+    &substrait::proto::FilterRel,
+) {
+    let rel::RelType::Aggregate(distinct) = root(&plan.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the distinct keys at the root");
+    };
+    assert!(distinct.measures.is_empty());
+    assert_eq!(distinct.grouping_expressions.len(), 1);
+    let rel::RelType::Filter(filter) = distinct.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected a filter under the distinct keys");
+    };
+    let rel::RelType::Read(read) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the key stream read");
+    };
+    assert!(matches!(
+        read.read_type.as_ref().unwrap(),
+        read_rel::ReadType::NamedTable(table) if table.names == ["sirius_stream_1000007"]
+    ));
+    (distinct, filter)
+}
+
+#[test]
+fn a_share_sends_its_distinct_non_null_keys() {
+    let plan = PlanTranslator::new()
+        .translate_filter_share(&share_stream("BIGINT"), None)
+        .unwrap();
+    assert_eq!(plan.output_names, vec!["rf_key".to_string()]);
+    assert_eq!(plan.stream_inputs, vec![share_stream("BIGINT")]);
+    assert_eq!(plan.output_partition_columns, None);
+    let (_, filter) = share_parts(&plan);
+    let Some(expression::RexType::ScalarFunction(not_null)) =
+        filter.condition.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected a null test");
+    };
+    assert_eq!(
+        function_name(&plan.plan, not_null.function_reference),
+        "is_not_null"
+    );
+}
+
+#[test]
+fn a_share_too_large_to_send_sends_its_bounds() {
+    let plan = PlanTranslator::new()
+        .translate_filter_share(&share_stream("INTEGER"), Some((3, 99)))
+        .unwrap();
+    assert_eq!(plan.output_names, vec!["rf_bound".to_string()]);
+    let (_, filter) = share_parts(&plan);
+    let Some(expression::RexType::ScalarFunction(or)) =
+        filter.condition.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected a disjunction");
+    };
+    assert_eq!(function_name(&plan.plan, or.function_reference), "or");
+    // `rf_key = 3 OR rf_key = 99`, with INTEGER literals for the INTEGER key.
+    let bounds: Vec<i32> = or
+        .arguments
+        .iter()
+        .map(|argument| {
+            let Some(substrait::proto::function_argument::ArgType::Value(value)) =
+                argument.arg_type.as_ref()
+            else {
+                panic!("expected a value argument");
+            };
+            let Some(expression::RexType::ScalarFunction(equal)) = value.rex_type.as_ref() else {
+                panic!("expected an equality");
+            };
+            assert_eq!(function_name(&plan.plan, equal.function_reference), "equal");
+            let Some(substrait::proto::function_argument::ArgType::Value(literal)) =
+                equal.arguments[1].arg_type.as_ref()
+            else {
+                panic!("expected a literal bound");
+            };
+            let Some(expression::RexType::Literal(expression::Literal {
+                literal_type: Some(expression::literal::LiteralType::I32(bound)),
+                ..
+            })) = literal.rex_type.as_ref()
+            else {
+                panic!("expected an INTEGER literal: {literal:?}");
+            };
+            *bound
+        })
+        .collect();
+    assert_eq!(bounds, vec![3, 99]);
+    // Only integer keys are sent.
+    assert!(
+        PlanTranslator::new()
+            .translate_filter_share(&share_stream("VARCHAR"), None)
+            .is_err()
+    );
+}
+
+fn function_name(plan: &substrait::proto::Plan, anchor: u32) -> String {
+    resolved_function(plan, anchor).1
+}
+
+/// DuckDB sums integers into HUGEINT, which cuDF can't hold and a BIGINT exchange refuses, so a
+/// two-phase integer `sum` (here COUNT's merge) is cast back to the declared BIGINT.
+#[test]
+fn two_phase_integer_sums_are_cast_back_to_their_declared_type() {
+    let plan = translate_merge(
+        merge_aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        ),
+        scalar_type(TPrimitiveType::BIGINT),
+    )
+    .unwrap();
+    let casts = root_casts(&plan.plan);
+    assert_eq!(casts.len(), 2, "{casts:?}");
+    assert_eq!(casts[0], None, "the grouping key passes through");
+    assert!(
+        matches!(
+            casts[1].as_ref().and_then(|ty| ty.kind.as_ref()),
+            Some(substrait::proto::r#type::Kind::I64(_))
+        ),
+        "{casts:?}"
     );
 }

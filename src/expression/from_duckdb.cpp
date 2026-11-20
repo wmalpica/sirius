@@ -34,6 +34,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/ast/unary_op.hpp"
 #include "expression/date_trunc_unit.hpp"
+#include "expression/decimal_divide_function.hpp"
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type, sirius::from_duckdb(ExpressionType)
 #include "expression/substring_slice.hpp"
@@ -394,6 +395,12 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
       // Validate against the original captures before adding the GPU wrapper groups.
       if (!regex.CheckRewriteString(replacement, &error)) { return nullptr; }
     }
+  }
+  if (*func_id_opt == function_id::decimal_divide &&
+      (!sirius::is_starrocks_decimal_divide_function(expr.Function()) ||
+       expr.GetChildren().size() != 3 ||
+       expr.GetReturnType().id() != duckdb::LogicalTypeId::DECIMAL)) {
+    return nullptr;
   }
   auto arguments = translate_children(expr.GetChildren());
   if (!arguments) { return nullptr; }

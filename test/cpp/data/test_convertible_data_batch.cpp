@@ -391,3 +391,22 @@ TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
   REQUIRE(total == batch1_size + batch2_size);
   REQUIRE(provider.get_bytes_in_space(e.host_space) == 0);
 }
+
+TEST_CASE("spill candidates recheck subscriptions acquired after selection",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+  cucascade::shared_data_repository repo;
+  auto batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  repo.add_data_batch(batch);
+  sirius::convertible_data_batch_provider provider(&repo);
+  auto candidate = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(candidate);
+  batch->subscribe();
+  auto result = candidate->convert({e.host_space}, e.stream(), *e.mgr, false);
+  batch->unsubscribe();
+  REQUIRE_FALSE(result.has_value());
+  REQUIRE(batch_in_space(*batch, e.gpu_space));
+  REQUIRE(candidate->convert({e.host_space}, e.stream(), *e.mgr, false).has_value());
+}

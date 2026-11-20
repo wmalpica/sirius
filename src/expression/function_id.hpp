@@ -88,7 +88,8 @@ enum class function_id : uint16_t {
   // Additional numeric functions
   round,
   abs,
-  negate,  // unary minus: DuckDB's one-argument "-"
+  negate,          // unary minus: DuckDB's one-argument "-"
+  decimal_divide,  // StarRocks explicit sirius_decimal_divide function; existing IDs stay fixed.
 };
 
 /**

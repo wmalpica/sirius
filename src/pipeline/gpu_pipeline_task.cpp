@@ -26,6 +26,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/starrocks_physical_streaming_sink.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
@@ -862,7 +863,26 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         throw oom_reschedule_exception(
           std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
       }
-      publish_output(*output_data, materialized.get(), stream);
+      try {
+        publish_output(*output_data, materialized.get(), stream);
+      } catch (const rmm::out_of_memory&) {
+        // Only the experimental sink guarantees that this failure published no rows.
+        // Main's sinks retain their existing non-replayable behavior.
+        auto const* experimental_sink =
+          dynamic_cast<const op::starrocks_physical_streaming_sink*>(pipeline->get_sink().get());
+        if (experimental_sink == nullptr || !experimental_sink->sink_publishes_on_success_only()) {
+          throw;
+        }
+        auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+        auto const input_bytes =
+          local_state.get_reservation_size_info()->bytes_to_materialize_input;
+        peak_bytes   = peak_bytes > input_bytes ? peak_bytes - input_bytes : 0;
+        auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+        global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+        materialized.reset();
+        throw oom_reschedule_exception(
+          std::move(output_data), operators.size(), "OOM partitioning a StarRocks fragment output");
+      }
     }
 
     // Record memory metrics for future reservation estimates. Measured after publish_output, not

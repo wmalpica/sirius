@@ -26,6 +26,7 @@
 #include "ast_test_builders.hpp"
 #include "catch.hpp"
 #include "expression/ast/from_duckdb.hpp"
+#include "expression/decimal_divide_function.hpp"
 
 #include <duckdb/main/settings.hpp>
 
@@ -1356,4 +1357,19 @@ TEST_CASE("ast_from_duckdb - case conversion functions translate", "[ast_from_du
   REQUIRE(function.arguments().size() == 1);
   REQUIRE(function.return_type().id() == sirius::type_id::VARCHAR);
   REQUIRE(out->cudf_ast_op_count() == 0);
+}
+
+TEST_CASE("StarRocks decimal division never captures an unrelated user function",
+          "[ast_from_duckdb][starrocks_function]")
+{
+  bool const impostor = GENERATE(false, true);
+  auto function       = sirius::get_decimal_divide_function();
+  if (impostor) { function.SetExtraFunctionInfo(nullptr); }
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> args;
+  args.push_back(make_bound_int_const(1));
+  args.push_back(make_bound_int_const(2));
+  args.push_back(make_bound_int_const(0));
+  auto expression = duckdb::make_uniq<BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(function), std::move(args), nullptr);
+  CHECK(static_cast<bool>(sirius::ast::from_duckdb(*expression)) == !impostor);
 }

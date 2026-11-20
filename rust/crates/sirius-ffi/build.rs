@@ -9,7 +9,14 @@ fn main() {
         .join("../../..")
         .canonicalize()
         .expect("resolve repository root");
-    cxx_build::bridge("src/bridge.rs")
+    let mut bridges = vec!["src/bridge.rs"];
+    if std::env::var_os("CARGO_FEATURE_STARROCKS_EXPERIMENTAL").is_some() {
+        bridges.push("src/experimental_bridge.rs");
+    }
+    for path in &bridges {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    cxx_build::bridges(bridges)
         .file("src/shim.cpp")
         .std("c++20")
         .include(repo.join("include"))

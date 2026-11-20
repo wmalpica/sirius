@@ -381,3 +381,9 @@ mod tests {
         assert!(result.is_err(), "missing config file should fail bring-up");
     }
 }
+
+/// Experimental fragment and exchange bindings used by the StarRocks prototype.
+#[cfg(feature = "starrocks-experimental")]
+pub mod experimental;
+#[cfg(feature = "starrocks-experimental")]
+mod experimental_bridge;

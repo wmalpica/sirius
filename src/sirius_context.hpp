@@ -86,6 +86,10 @@ class distributed_session;
 class exchange_service;
 }  // namespace sirius::exchange
 
+namespace sirius::exec {
+class exchange_staging;
+}
+
 namespace duckdb {
 
 class Connection;
@@ -788,6 +792,8 @@ class SiriusContext : public ClientContextState {
     return query_lifecycle_;
   }
 
+  [[nodiscard]] sirius::exec::exchange_staging& get_exchange_staging();
+
   [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
   [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
@@ -1049,6 +1055,8 @@ class SiriusContext : public ClientContextState {
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
+  std::once_flag exchange_staging_once_;
+  std::unique_ptr<sirius::exec::exchange_staging> exchange_staging_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
   /// Observes where a query is in its execution.  Declared before the creator

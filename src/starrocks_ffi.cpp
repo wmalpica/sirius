@@ -1,0 +1,1395 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Implementation of sirius/starrocks_ffi.hpp. This translation unit sees the heavy internal types
+// so consumers (e.g. the Rust bindings) never include sirius_context.hpp.
+
+#include "sirius/starrocks_ffi.hpp"
+
+#include "config.hpp"                                    // duckdb::Config::LOG_*
+#include "core_functions_extension.hpp"                  // duckdb::CoreFunctionsExtension
+#include "data/sirius_converter_registry.hpp"            // sirius::converter_registry
+#include "downgrade/downgrade_executor.hpp"              // sirius::parallel::downgrade_executor
+#include "duckdb/catalog/catalog.hpp"                    // duckdb::Catalog
+#include "duckdb/catalog/catalog_transaction.hpp"        // duckdb::CatalogTransaction
+#include "duckdb/common/enums/optimizer_type.hpp"        // duckdb::OptimizerType
+#include "duckdb/execution/column_binding_resolver.hpp"  // duckdb::ColumnBindingResolver
+#include "duckdb/main/client_context.hpp"                // duckdb::ClientContext
+#include "duckdb/main/config.hpp"                        // duckdb::DBConfig
+#include "duckdb/main/connection.hpp"                    // duckdb::Connection
+#include "duckdb/main/database.hpp"                      // duckdb::DuckDB
+#include "duckdb/main/prepared_statement_data.hpp"       // duckdb::PreparedStatementData
+#include "duckdb/main/query_result.hpp"                  // duckdb::QueryResult
+#include "duckdb/main/relation.hpp"                      // duckdb::Relation
+#include "duckdb/main/settings.hpp"
+#include "duckdb/optimizer/optimizer.hpp"  // duckdb::Optimizer
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
+#include "duckdb/planner/planner.hpp"                      // duckdb::Planner
+#include "exec/arrow_result_stream.hpp"
+#include "exec/exchange_inbox.hpp"      // sirius::exec::exchange_inbox
+#include "exec/exchange_ring_ends.hpp"  // sirius::exec::ring_exchange
+#include "exec/starrocks_streaming_fragment.hpp"  // sirius::exec::starrocks_streaming_fragment, starrocks_fragment_spec
+#include "exec/starrocks_substrait_compat.hpp"
+#include "exec/stream_bind_catalog.hpp"            // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"           // sirius::exec::register_stream_source_function
+#include "expression/decimal_divide_function.hpp"  // sirius::register_decimal_divide_function
+#include "from_substrait.hpp"           // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/type_conversions.hpp"  // sirius::from_duckdb
+#include "log/logging.hpp"              // SIRIUS_LOG_INFO
+#include "object_store_scope/registry.hpp"
+#include "object_store_scope/scope.hpp"
+#include "object_store_scope/settings.hpp"
+#include "object_store_scope/validation.hpp"
+#include "parquet_extension.hpp"              // duckdb::ParquetExtension
+#include "planner/substrait_scan_ranges.hpp"  // sirius::planner::scan_byte_ranges_state
+#include "planner/unsupported_optimizers.hpp"
+#include "sirius_config.hpp"   // sirius::sirius_config
+#include "sirius_context.hpp"  // duckdb::SiriusContext
+#include "sirius_ffi_testing.hpp"
+#include "sirius_registration.hpp"  // duckdb::SiriusRegistration (pin_table registration)
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+
+namespace sirius::starrocks_ffi {
+
+// What a Context and its Interrupters share. `open` brackets the run that interrupt() may cancel,
+// so an interrupt never lands between runs or in the COMMIT/ROLLBACK after one: a failed ROLLBACK
+// would leave the connection's transaction open, and every later BEGIN on it would fail. `conn`
+// is cleared before the Context tears the connection down.
+struct Interrupter::Gate {
+  std::mutex mutex;
+  duckdb::Connection* conn{nullptr};
+  bool open{false};
+
+  void interrupt() noexcept
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    // Sets the ClientContext's interrupt flag, which the GPU executor checks per task.
+    if (conn && open) { conn->Interrupt(); }
+  }
+};
+
+namespace {
+
+// Opens `gate` for one run. Closing it clears an interrupt that arrived during the run, so the
+// next run starts uninterrupted (BEGIN TRANSACTION clears the flag too, but nothing relies on it).
+class interruptible_run {
+ public:
+  explicit interruptible_run(Interrupter::Gate& gate) : gate_(gate)
+  {
+    std::lock_guard<std::mutex> lock(gate_.mutex);
+    gate_.open = true;
+  }
+  ~interruptible_run()
+  {
+    std::lock_guard<std::mutex> lock(gate_.mutex);
+    gate_.open = false;
+    gate_.conn->context->ClearInterrupt();
+  }
+
+  interruptible_run(const interruptible_run&)            = delete;
+  interruptible_run& operator=(const interruptible_run&) = delete;
+
+ private:
+  Interrupter::Gate& gate_;
+};
+
+constexpr const char* kSiriusStateKey   = "sirius_state";
+constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
+
+// DuckDB view name a plan uses to read input stream `id`.
+std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + std::to_string(id); }
+
+// The embedded DuckDB never loads the Sirius extension, so nothing on this path reads the
+// SIRIUS_LOG_{BACKEND,DIR,LEVEL} environment the transparent path honors
+// (SiriusContextExtensionCallback) — the engine would run with the noop sink and no log would
+// reach the embedder. Install the same sink here when the embedder asks for one; without any
+// of the variables the sink is left untouched (noop by default).
+void install_log_sink_from_env()
+{
+  auto const* backend_env = std::getenv("SIRIUS_LOG_BACKEND");
+  auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
+  auto const* level_env   = std::getenv("SIRIUS_LOG_LEVEL");
+  if (!backend_env && !log_dir_env && !level_env) { return; }
+  // Serialize the complete settings update, including rollback if sink creation fails.
+  std::lock_guard log_lock(duckdb::Config::logging_mutex);
+  auto previous_backend = duckdb::Config::LOG_BACKEND;
+  auto previous_log_dir = duckdb::Config::LOG_DIR;
+  auto previous_level   = duckdb::Config::LOG_LEVEL;
+  try {
+    if (backend_env) { duckdb::Config::LOG_BACKEND = backend_env; }
+    if (log_dir_env) { duckdb::Config::LOG_DIR = log_dir_env; }
+    if (level_env) { duckdb::Config::LOG_LEVEL = level_env; }
+    // With no database, an unknown backend leaves the current sink in place.
+    duckdb::install_configured_log_sink(nullptr);
+  } catch (...) {
+    // Sink construction can throw (for example, if LOG_DIR cannot be created).
+    // It happens before set_sink(), so the previous sink is still active.
+    duckdb::Config::LOG_BACKEND.swap(previous_backend);
+    duckdb::Config::LOG_DIR.swap(previous_log_dir);
+    duckdb::Config::LOG_LEVEL.swap(previous_level);
+    throw;
+  }
+}
+
+double elapsed_ms(std::chrono::steady_clock::time_point since)
+{
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since)
+    .count();
+}
+
+// --- Test-only capture pause seam --------------------------------------------------------------
+
+// The installed callable is held through an owning handle so that the mutex only ever guards
+// a pointer copy/swap: constructing, copying, invoking and destroying the callable (all of which
+// may run user code that installs or clears hooks) happen outside the lock.
+std::mutex capture_pause_mutex;
+std::shared_ptr<const std::function<void()>> capture_pause_hook;
+
+std::mutex transaction_entry_mutex;
+std::shared_ptr<const std::function<void()>> transaction_entry_hook;
+
+// Runs the installed hook (if any) outside the hook mutex, so the hook may itself install or
+// clear hooks or touch the Context's thread-safe members.
+void run_hook(std::mutex& mutex, std::shared_ptr<const std::function<void()>> const& slot)
+{
+  std::shared_ptr<const std::function<void()>> hook;
+  {
+    std::lock_guard lock(mutex);
+    hook = slot;
+  }
+  if (hook) { (*hook)(); }
+}
+
+void run_capture_pause_hook() { run_hook(capture_pause_mutex, capture_pause_hook); }
+void run_transaction_entry_hook() { run_hook(transaction_entry_mutex, transaction_entry_hook); }
+
+// --- ObjectStoreConfig checks ------------------------------------------------------------------
+//
+// Run at put_object_store() and at the object-store factory without object-store network
+// access or backend-resource creation. CA readability may access the local filesystem.
+// Errors name the field and a fixed reason, never its value. Authentication, TLS and
+// network failures are reported when a snapshot is used.
+
+// Options the IO backend cannot honor are refused rather than ignored. At this tree the only
+// registered backend is the Sirius stack (uring + REST), whatever the configuration selects: no
+// S3-over-RDMA backend exists.
+constexpr sirius::object_store_scope::capabilities kBackendCapabilities{};
+
+sirius::object_store_scope::settings to_settings(const ObjectStoreConfig& cfg)
+{
+  return {.endpoint       = cfg.endpoint,
+          .region         = cfg.region,
+          .access_key     = cfg.access_key,
+          .secret_key     = cfg.secret_key,
+          .session_token  = cfg.session_token,
+          .transport      = static_cast<std::uint32_t>(cfg.transport),
+          .signing_mode   = static_cast<std::uint32_t>(cfg.signing_mode),
+          .ca_bundle_path = cfg.ca_bundle_path,
+          .uri_prefix     = cfg.uri_prefix};
+}
+
+[[noreturn]] void throw_violation(const sirius::object_store_scope::violation& refused)
+{
+  throw std::invalid_argument("ObjectStoreConfig." + std::string{refused.field} + ": " +
+                              sirius::object_store_scope::describe(refused));
+}
+
+void check_object_store(const ObjectStoreConfig& cfg)
+{
+  if (auto const refused =
+        sirius::object_store_scope::check_settings(to_settings(cfg), kBackendCapabilities)) {
+    throw_violation(*refused);
+  }
+}
+
+// Publishes `cfg` on `registry` for the scope its uri_prefix names; a refused field throws. The
+// registry keeps `cfg` itself as the owner of the entry, so a lookup returns the published
+// pointer. The caller keeps its own reference across the call.
+void publish_snapshot(sirius::object_store_scope::registry& registry,
+                      const std::shared_ptr<ObjectStoreConfig>& cfg)
+{
+  auto const result = registry.publish(
+    std::make_shared<const sirius::object_store_scope::settings>(to_settings(*cfg)),
+    cfg,
+    kBackendCapabilities);
+  if (result.refused) { throw_violation(*result.refused); }
+}
+
+// The FFI texts of the refusals; each starts with the stable reason token.
+[[noreturn]] void throw_refusal(const sirius::object_store_scope::refusal& refused)
+{
+  using sirius::object_store_scope::refusal_kind;
+  switch (refused.kind) {
+    case refusal_kind::unconfigured:
+      throw sirius::invalid_input_exception(
+        "object_store_unconfigured: the plan reads '{}' from an object store or through an Iceberg "
+        "metadata path, but this Context has no object-store snapshot (Context::put_object_store)",
+        refused.item);
+    case refusal_kind::unmatchable_key:
+      throw sirius::invalid_input_exception(
+        "object_store_scope: '{}' names a key segment that cannot be matched byte-for-byte "
+        "against the published uri_prefix set",
+        refused.item);
+    case refusal_kind::out_of_scope:
+      throw sirius::invalid_input_exception(
+        "object_store_scope: the plan reads '{}', outside every published uri_prefix",
+        refused.item);
+    case refusal_kind::route_unavailable:
+      throw sirius::invalid_input_exception(
+        "object_store_route_unavailable: the plan reads '{}' from an object store; native "
+        "object-store reads are not yet served on the FFI path",
+        refused.item);
+  }
+  throw sirius::invalid_input_exception(
+    std::string{sirius::object_store_scope::token_of(refused.kind)});
+}
+
+// A plan that reads from an object store is refused here, before DuckDB's consumer can bind the
+// read: without a snapshot there is nothing to serve it with; outside the snapshot's namespace
+// the read is out of scope; and until the native object-store route lands, a configured context
+// refuses too rather than letting the read reach a legacy path/default route. The offending item
+// is named in redacted form; no secret lookup and no network access happen. Each message starts
+// with a stable reason token.
+void refuse_remote_reads(const std::vector<std::string>& remote_paths,
+                         const sirius::object_store_scope::scope_set& set)
+{
+  if (auto const refused = sirius::object_store_scope::classify_remote_reads(set, remote_paths)) {
+    throw_refusal(*refused);
+  }
+}
+
+// Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator. `scopes` is the set of
+// object-store snapshots the execution captured when its binding began (empty = none).
+sirius::exec::starrocks_bound_plan lower_substrait(
+  duckdb::Connection& conn,
+  const std::string& substrait_plan,
+  const sirius::object_store_scope::scope_set& scopes)
+{
+  auto& client = *conn.context;
+
+  // Byte-ranged parquet splits ride the plan's LocalFiles items, but DuckDB's consumer and
+  // parquet binding cannot carry them — extract into a per-plan state the physical plan
+  // generator consumes. Always replaced (and removed when this plan has none), so a stale
+  // registry can never leak a previous plan's ranges into this one. The same parse lists the
+  // plan's remote reads, which are refused or scoped before anything binds them.
+  client.registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+  auto inputs = sirius::planner::inspect_scan_plan_inputs(substrait_plan);
+  refuse_remote_reads(inputs.remote_paths, scopes);
+  if (!inputs.byte_ranges.empty()) {
+    client.registered_state->Insert(
+      sirius::planner::scan_byte_ranges_state::kStateKey,
+      duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(
+        std::move(inputs.byte_ranges)));
+  }
+
+  auto const compatible_plan = sirius::exec::starrocks_compatible_substrait(substrait_plan);
+  duckdb::SubstraitToDuckDB transformer(conn.context, compatible_plan, /*json=*/false);
+  auto relation = transformer.TransformPlan();
+
+  duckdb::Planner planner(client);
+  planner.CreatePlan(duckdb::make_uniq<duckdb::RelationStatement>(relation));
+
+  auto prepared =
+    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
+  prepared->names     = planner.names;
+  prepared->types     = planner.types;
+  prepared->value_map = std::move(planner.value_map);
+
+  auto logical_plan = std::move(planner.plan);
+  if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(client)) {
+    duckdb::Optimizer optimizer(*planner.binder, client);
+    logical_plan = optimizer.Optimize(std::move(logical_plan));
+  }
+  logical_plan->ResolveOperatorTypes();
+  duckdb::ColumnBindingResolver resolver;
+  duckdb::ColumnBindingResolver verifier(true);
+  verifier.VisitOperator(*logical_plan);
+  resolver.VisitOperator(*logical_plan);
+
+  return {std::move(logical_plan), std::move(prepared)};
+}
+
+// Run `body` in a transaction on `conn`; a failed rollback does not replace body's error.
+// `serial` is held throughout because every Fragment of a Context shares `conn`, and a second
+// BEGIN on it fails (and invalidates the open transaction) instead of waiting.
+template <typename Body>
+void in_transaction(std::mutex& serial, duckdb::Connection& conn, Body&& body)
+{
+  run_transaction_entry_hook();
+  std::lock_guard<std::mutex> lock(serial);
+  conn.BeginTransaction();
+  try {
+    body();
+  } catch (...) {
+    try {
+      conn.Rollback();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+    throw;
+  }
+  conn.Commit();
+}
+
+// Exports `batch` as a ring job and sets the out-parameters; null for a batch without rows. An
+// out_of_memory hands the batch to `keep` before it propagates: the caller may wait and ask again.
+template <typename Keep>
+std::unique_ptr<std::vector<std::uint8_t>> export_to_ring(
+  sirius::exec::ring_exchange& ring,
+  std::shared_ptr<cucascade::data_batch> batch,
+  Keep&& keep,
+  std::uint64_t& token,
+  std::uint64_t& rows,
+  std::uint64_t& stream_bytes)
+{
+  std::optional<sirius::exec::ring_exchange::send_job> job;
+  try {
+    job = ring.export_batch(batch);
+  } catch (rmm::out_of_memory const&) {
+    keep(std::move(batch));
+    throw;
+  }
+  if (!job) { return nullptr; }
+  token        = job->token;
+  rows         = job->rows;
+  stream_bytes = job->stream_bytes;
+  return std::make_unique<std::vector<std::uint8_t>>(std::move(job->header));
+}
+
+}  // namespace
+
+// PIMPL: holds the engine + embedded DuckDB using DuckDB's own smart pointers
+// (duckdb::shared_ptr, so the SiriusContext can register as a ClientContextState).
+struct Context::Impl {
+  duckdb::shared_ptr<duckdb::SiriusContext> context;
+  duckdb::unique_ptr<duckdb::DuckDB> db;
+  duckdb::unique_ptr<duckdb::Connection> conn;
+  // Serializes transactions on `conn`; see in_transaction().
+  std::mutex conn_mutex;
+  // The published scope set. An execution captures the current set when its binding begins,
+  // inside the connection transaction; object-store I/O routing is not implemented here. No
+  // registry lock is held while conn_mutex is taken.
+  sirius::object_store_scope::registry object_store;
+  // Shared with every ExchangeInbox handle, which may outlive this Context.
+  std::shared_ptr<sirius::exec::exchange_inbox> exchange;
+  // The ring exchange, when the context was made with one; shared with RingExchange handles.
+  std::shared_ptr<sirius::exec::ring_exchange> ring;
+
+  std::shared_ptr<Interrupter::Gate> gate = std::make_shared<Interrupter::Gate>();
+
+  Impl()                       = default;
+  Impl(const Impl&)            = delete;
+  Impl& operator=(const Impl&) = delete;
+  // Detaches every Interrupter, then frees the ring's and the exchange's buffers while the memory
+  // space they come from still exists.
+  ~Impl()
+  {
+    {
+      std::lock_guard<std::mutex> lock(gate->mutex);
+      gate->conn = nullptr;
+    }
+    if (ring) { ring->close(); }
+    if (exchange) { exchange->close(); }
+  }
+
+  /// Points the ring's landings at the GPU space, the host space nearest the GPU and the first
+  /// disk space.
+  void attach_ring(Context::RingOptions const& opts)
+  {
+    if (!exchange) {
+      throw sirius::invalid_input_exception(
+        "Context: the ring exchange needs exactly one GPU memory space");
+    }
+    auto& gpu = exchange->space();
+    if (gpu.get_device_id() != ring->device()) {
+      throw sirius::invalid_input_exception(
+        "Context: the ring exchange is on device {} but the GPU memory space on device {}",
+        ring->device(),
+        gpu.get_device_id());
+    }
+    auto& memory  = context->get_memory_manager();
+    int host_numa = -1;
+    if (cudaDeviceGetAttribute(&host_numa, cudaDevAttrHostNumaId, ring->device()) != cudaSuccess) {
+      static_cast<void>(cudaGetLastError());
+      host_numa = -1;
+    }
+    sirius::exec::ring_exchange::landing_tiers tiers;
+    for (auto const* host : memory.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+      if (tiers.host == nullptr || host->get_device_id() == host_numa) {
+        tiers.host = const_cast<cucascade::memory::memory_space*>(host);
+      }
+    }
+    if (auto const disks = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
+        !disks.empty()) {
+      tiers.disk = const_cast<cucascade::memory::memory_space*>(disks.front());
+    }
+    tiers.gpu_bytes = static_cast<std::size_t>(opts.gpu_landing_fraction *
+                                               static_cast<double>(gpu.get_max_memory()));
+    // Without a size from the embedder, landings may hold half the host tier, whatever its size.
+    tiers.host_bytes =
+      tiers.host == nullptr ? 0
+      : opts.host_landing_bytes != 0
+        ? opts.host_landing_bytes
+        : sirius::exec::ring_exchange::default_host_landing_bytes(tiers.host->get_max_memory());
+    ring->attach(exchange, tiers);
+    SIRIUS_LOG_INFO(
+      "ring exchange: frames of {} B, send ring {} B, receive ring {} B; landings may hold {} B "
+      "of GPU, {} B of host{}",
+      ring->frame_bytes(),
+      ring->send_ring().bytes(),
+      ring->recv_ring().bytes(),
+      tiers.gpu_bytes,
+      tiers.host_bytes,
+      tiers.disk ? ", then disk" : ", no disk tier");
+  }
+
+  sirius::exec::exchange_inbox& require_exchange() const
+  {
+    if (!exchange) {
+      throw sirius::invalid_input_exception(
+        "Fragment: exchange inbox requires a single GPU memory space");
+    }
+    return *exchange;
+  }
+
+  void bring_up(const sirius::parsed_sirius_config& config,
+                std::optional<Context::RingOptions> ring_options = std::nullopt)
+  {
+    install_log_sink_from_env();
+    if (ring_options) {
+      // Before the engine's pool, so the rings are not carved out of its budget.
+      int device = 0;
+      if (cudaGetDevice(&device) != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        throw sirius::internal_exception("Context: no current CUDA device for the ring exchange");
+      }
+      // A size left at 0 follows the device's memory, so a 32 GB GPU gives the rings the same
+      // share as a 189 GB one.
+      std::size_t free_bytes = 0, device_bytes = 0;
+      if (cudaMemGetInfo(&free_bytes, &device_bytes) != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        throw sirius::internal_exception("Context: cannot read the device's memory for the rings");
+      }
+      auto opts =
+        sirius::exec::ring_exchange::options::sized_for(device_bytes, ring_options->frame_bytes);
+      if (ring_options->send_bytes != 0) { opts.send_bytes = ring_options->send_bytes; }
+      if (ring_options->recv_bytes != 0) { opts.recv_bytes = ring_options->recv_bytes; }
+      opts.disk_writers = ring_options->disk_writers;
+      if (auto const* value = std::getenv("SIRIUS_CN_RING_RETURN_SPILLED")) {
+        opts.return_spilled = std::string_view{value} == "1";
+      }
+      ring = std::make_shared<sirius::exec::ring_exchange>(device, opts);
+    }
+    context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
+    context->initialize(config);
+    auto& memory    = context->get_memory_manager();
+    auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (gpus.size() == 1) {
+      auto& gpu =
+        *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id());
+      exchange = std::make_shared<sirius::exec::exchange_inbox>(gpu);
+      // Received batches can wait a long time for their receivers. Let them spill to host under
+      // pressure rather than fail the query when a shuffle outgrows the pool.
+      exchange->enable_spill(
+        context->get_exchange_staging(), [ctx = context.get(), space = &gpu](std::size_t bytes) {
+          // The spill stops once this reservation is made, and keeps what it
+          // freed for it.
+          std::mutex mutex;
+          std::unique_ptr<cucascade::memory::reservation> made;
+          auto const reserve = [&] {
+            std::lock_guard const lock{mutex};
+            if (!made) { made = space->make_reservation_or_null(bytes); }
+            return made != nullptr;
+          };
+          ctx->get_downgrade_executor(space->get_id()).request_free_memory_and_wait(bytes);
+          reserve();
+          return std::move(made);
+        });
+    }
+    if (ring) { attach_ring(*ring_options); }
+
+    // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
+    db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);
+    db->LoadStaticExtension<duckdb::CoreFunctionsExtension>();
+    db->LoadStaticExtension<duckdb::ParquetExtension>();
+    // Cache parquet footers across binds. The Substrait consumer builds the plan through the
+    // Relation API, which re-binds the whole subtree at every level, so a read of one file is
+    // bound once per operator above it; with the cache off each bind re-parses the footer and
+    // re-derives the column statistics (~0.5 s per bind for a 25 GB, 5k-row-group TPC-H SF100
+    // lineitem: Q21 spent 10 s lowering against 4.6 s executing). Set the option at the
+    // database level so every connection on this private DuckDB instance inherits it.
+    // This DuckDB instance is private to the engine, and the cache validates file mtimes.
+    duckdb::DBConfig::GetConfig(*db->instance)
+      .SetOptionByName("parquet_metadata_cache", duckdb::Value::BOOLEAN(true));
+    conn = duckdb::make_uniq<duckdb::Connection>(*db);
+    {
+      std::lock_guard<std::mutex> lock(gate->mutex);
+      gate->conn = conn.get();
+    }
+    // Register the engine on the connection and disable DuckDB optimizer rewrites this
+    // no-fallback FFI path cannot safely execute.
+    auto& client = *conn->context;
+    client.registered_state->Insert(kSiriusStateKey, context);
+    // Per-connection Sirius state (guard depths, capture bookkeeping) for the
+    // embedded connection, mirroring OnConnectionOpened on the transparent path.
+    client.registered_state->Insert("sirius_connection_state",
+                                    duckdb::make_shared_ptr<duckdb::SiriusConnectionState>());
+
+    // Fragment bind path: register catalog + sirius_stream_source before any plan binds.
+    client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey,
+                                    duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
+    sirius::exec::register_stream_source_function(*db->instance);
+    duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+      client, duckdb::SetScope::LOCAL, duckdb::Value::BOOLEAN(true));
+
+    // pin_table/unpin_table on the embedded catalog, so Context::pin_table can run
+    // the same table function the extension registers (same bind, same behavior).
+    {
+      using namespace duckdb;
+      auto transaction = CatalogTransaction::GetSystemTransaction(*db->instance);
+      auto& catalog    = Catalog::GetSystemCatalog(*db->instance);
+      TableFunctionSet pin_set("pin_table");
+      auto add_pin = [&](vector<LogicalType> args) {
+        TableFunction pin("pin_table",
+                          std::move(args),
+                          SiriusRegistration::PinTableFunction,
+                          SiriusRegistration::PinTableBind);
+        pin.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+          options.Add("tier", LogicalType::VARCHAR);
+          options.Add("name", LogicalType::VARCHAR);
+          options.Add("cols", LogicalType::LIST(LogicalType::VARCHAR));
+          options.Add("unique_cols", LogicalType::LIST(LogicalType::VARCHAR));
+          options.Add("compression", LogicalType::BOOLEAN);
+          options.Add("format", LogicalType::VARCHAR);
+          options.Add("schema_name", LogicalType::VARCHAR);
+        });
+        pin_set.AddFunction(std::move(pin));
+      };
+      add_pin({LogicalType::VARCHAR});
+      add_pin({});
+      CreateTableFunctionInfo pin_info(pin_set);
+      pin_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      catalog.CreateTableFunction(transaction, pin_info);
+      TableFunction unpin("unpin_table",
+                          {LogicalType::VARCHAR},
+                          SiriusRegistration::UnpinTableFunction,
+                          SiriusRegistration::UnpinTableBind);
+      CreateTableFunctionInfo unpin_info(unpin);
+      unpin_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      catalog.CreateTableFunction(transaction, unpin_info);
+    }
+    // Fragment plans compute DECIMAL `/` and AVG with sirius_decimal_divide().
+    sirius::register_decimal_divide_function(*db->instance);
+    auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
+    disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
+    disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
+    disabled.insert(sirius::planner::unsupported_optimizers.begin(),
+                    sirius::planner::unsupported_optimizers.end());
+    // Keep this FFI-only restriction until its no-fallback execution path has
+    // dedicated GPU_VALUES coverage.
+    disabled.insert(duckdb::OptimizerType::STATISTICS_PROPAGATION);
+    disabled.insert(duckdb::OptimizerType::COLUMN_LIFETIME);
+    // Rewrites an ORDER BY ... LIMIT parquet scan into a semi-join on virtual
+    // file_index/file_row_number columns the GPU scan drops.
+    disabled.insert(duckdb::OptimizerType::LATE_MATERIALIZATION);
+  }
+};
+
+Context::Context() : impl_(std::make_unique<Impl>())
+{
+  sirius::parsed_sirius_config config;
+  impl_->bring_up(config);
+}
+
+Context::Context(const std::string& config_path) : impl_(std::make_unique<Impl>())
+{
+  auto config = sirius::parsed_sirius_config::from_file(config_path);
+  impl_->bring_up(config);
+}
+
+Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+std::shared_ptr<ObjectStoreConfig> Context::object_store_config_for(std::string_view uri) const
+{
+  auto const resolved = impl_->object_store.lookup(uri);
+  if (resolved.refused) { throw_refusal(*resolved.refused); }
+  if (!resolved.hit) { return nullptr; }
+  return std::static_pointer_cast<ObjectStoreConfig>(resolved.hit->owner);
+}
+
+void Context::put_object_store(std::shared_ptr<ObjectStoreConfig> cfg) const
+{
+  if (!cfg) { throw std::invalid_argument("object_store: put_object_store requires a snapshot"); }
+  publish_snapshot(impl_->object_store, cfg);
+  SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot published for {} scope",
+                  cfg->uri_prefix.empty() ? "the default" : "a prefixed");
+}
+
+void Context::drop_object_store(std::string_view uri_prefix) const
+{
+  auto const result = impl_->object_store.drop(uri_prefix);
+  if (result.refused) { throw_violation(*result.refused); }
+  if (result.published) {
+    SIRIUS_LOG_INFO("[sirius_ffi] object store snapshot dropped for {} scope",
+                    uri_prefix.empty() ? "the default" : "a prefixed");
+  }
+}
+
+std::shared_ptr<ObjectStoreConfig> ObjectStoreConfig::with_credentials(
+  const std::string& new_access_key,
+  const std::string& new_secret_key,
+  const std::string& new_session_token) const
+{
+  return std::make_shared<ObjectStoreConfig>(ObjectStoreConfig{.endpoint       = endpoint,
+                                                               .region         = region,
+                                                               .access_key     = new_access_key,
+                                                               .secret_key     = new_secret_key,
+                                                               .session_token  = new_session_token,
+                                                               .transport      = transport,
+                                                               .signing_mode   = signing_mode,
+                                                               .ca_bundle_path = ca_bundle_path,
+                                                               .uri_prefix     = uri_prefix});
+}
+
+Context::Context(const std::string& config_path, RingOptions const& ring)
+  : impl_(std::make_unique<Impl>())
+{
+  auto config = config_path.empty() ? sirius::parsed_sirius_config{}
+                                    : sirius::parsed_sirius_config::from_file(config_path);
+  impl_->bring_up(config, ring);
+}
+
+// Defined here, where the heavy types are complete: destroying `impl_` tears down
+// the embedded DuckDB and the initialized engine.
+Context::~Context() = default;
+
+void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr)
+{
+  auto& client = *impl_->conn->context;
+
+  // Binding (catalog lookups), optimization, and GPU execution all need an active
+  // transaction: scans read DuckDB MVCC state through it. GPU execution is eager (the result
+  // is materialized), so the transaction can close before the Arrow stream is consumed.
+  duckdb::unique_ptr<duckdb::QueryResult> result;
+  // Phase timings (lowering / physical planning / GPU execution), logged per query: the embedder
+  // only sees the total, and the query window in the telemetry covers execution alone.
+  double lower_ms = 0, plan_ms = 0, execute_ms = 0;
+  std::shared_ptr<const sirius::object_store_scope::scope_set> snapshot;
+  in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
+    // Captured once the transaction is held and before any binding consumes credentials: a
+    // call still queued before this boundary may observe a later publication.
+    snapshot = impl_->object_store.capture();
+    run_capture_pause_hook();
+    interruptible_run interruptible(*impl_->gate);
+    // The same result path as a zero-output Fragment.
+    sirius::exec::starrocks_fragment_spec spec;
+    spec.plan_source = [&](duckdb::ClientContext&) {
+      auto const lower_started = std::chrono::steady_clock::now();
+      auto bound               = lower_substrait(*impl_->conn, plan, *snapshot);
+      lower_ms                 = elapsed_ms(lower_started);
+      return bound;
+    };
+    sirius::exec::starrocks_streaming_fragment fragment(client, std::move(spec));
+    auto const plan_started = std::chrono::steady_clock::now();
+    fragment.build();
+    plan_ms = elapsed_ms(plan_started) - lower_ms;
+
+    auto const execute_started = std::chrono::steady_clock::now();
+    fragment.run();
+    result     = fragment.take_result();
+    execute_ms = elapsed_ms(execute_started);
+  });
+  SIRIUS_LOG_INFO(
+    "[sirius_ffi] execute_substrait: lower {:.1f} ms, plan {:.1f} ms, execute {:.1f} ms",
+    lower_ms,
+    plan_ms,
+    execute_ms);
+
+  sirius::exec::export_arrow_result(
+    std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
+}
+
+std::unique_ptr<ExchangeInbox> Context::exchange_inbox() const
+{
+  if (!impl_->exchange) { return nullptr; }
+  // Not make_unique: the constructor is private to Context.
+  return std::unique_ptr<ExchangeInbox>(new ExchangeInbox(impl_->exchange));
+}
+
+std::unique_ptr<RingExchange> Context::ring_exchange() const
+{
+  if (!impl_->ring) { return nullptr; }
+  return std::unique_ptr<RingExchange>(new RingExchange(impl_->ring));
+}
+
+RingExchange::RingExchange(std::shared_ptr<sirius::exec::ring_exchange> ring)
+  : ring_(std::move(ring))
+{
+}
+
+int RingExchange::device() const noexcept { return ring_->device(); }
+std::uintptr_t RingExchange::send_base() const noexcept { return ring_->send_ring().base(); }
+std::uint64_t RingExchange::send_len() const noexcept { return ring_->send_ring().bytes(); }
+std::uintptr_t RingExchange::recv_base() const noexcept { return ring_->recv_ring().base(); }
+std::uint64_t RingExchange::recv_len() const noexcept { return ring_->recv_ring().bytes(); }
+std::uint64_t RingExchange::frame_bytes() const noexcept { return ring_->frame_bytes(); }
+
+std::int64_t RingExchange::lease_send() const
+{
+  auto const frame = ring_->send_ring().lease();
+  return frame ? static_cast<std::int64_t>(*frame) : -1;
+}
+
+std::int64_t RingExchange::lease_recv() const
+{
+  auto const frame = ring_->recv_ring().lease();
+  return frame ? static_cast<std::int64_t>(*frame) : -1;
+}
+
+void RingExchange::release_send(std::uint32_t frame) const { ring_->send_ring().release(frame); }
+
+void RingExchange::release_recv(std::uint32_t frame) const { ring_->recv_ring().release(frame); }
+
+std::uint64_t RingExchange::stage(std::uint64_t token, std::uint32_t k, std::uint32_t frame) const
+{
+  return ring_->stage(token, k, frame);
+}
+
+void RingExchange::release_job(std::uint64_t token) const { ring_->release_job(token); }
+
+std::uint64_t RingExchange::begin(std::uintptr_t header_addr,
+                                  std::size_t header_len,
+                                  std::uint8_t& tier,
+                                  std::uint64_t& rows,
+                                  std::uint32_t& frames) const
+{
+  auto const landing =
+    ring_->begin({reinterpret_cast<std::uint8_t const*>(header_addr), header_len});
+  tier   = landing.tier == cucascade::memory::Tier::GPU    ? 0
+           : landing.tier == cucascade::memory::Tier::HOST ? 1
+                                                           : 2;
+  rows   = landing.rows;
+  frames = landing.frames;
+  return landing.id;
+}
+
+std::uint64_t RingExchange::copy_out(std::uint64_t landing,
+                                     std::uint32_t k,
+                                     std::uint32_t frame,
+                                     std::uint64_t len) const
+{
+  return ring_->copy_out(landing, k, frame, len);
+}
+
+std::uint64_t RingExchange::seal(std::uint64_t landing) const { return ring_->seal(landing); }
+
+void RingExchange::abort(std::uint64_t landing) const { ring_->abort(landing); }
+
+bool RingExchange::done(std::uint64_t ticket) const { return ring_->done(ticket); }
+
+std::unique_ptr<std::string> RingExchange::stats_line() const
+{
+  return std::make_unique<std::string>(ring_->stats_line());
+}
+
+ExchangeInbox::ExchangeInbox(std::shared_ptr<sirius::exec::exchange_inbox> exchange)
+  : exchange_(std::move(exchange))
+{
+}
+
+void ExchangeInbox::release(std::uint64_t token) const { exchange_->release(token); }
+
+std::size_t ExchangeInbox::outstanding() const { return exchange_->outstanding(); }
+
+void ExchangeInbox::key_stats(std::uint64_t token,
+                              std::uint32_t column,
+                              std::uint64_t& rows,
+                              std::uint64_t& distinct,
+                              std::int64_t& min,
+                              std::int64_t& max) const
+{
+  sirius::exec::exchange_inbox::key_stats stats{rows, distinct, min, max};
+  exchange_->add_key_stats(*exchange_->peek_batch(token), static_cast<int>(column), stats);
+  rows     = stats.rows;
+  distinct = stats.distinct;
+  min      = stats.min;
+  max      = stats.max;
+}
+
+OutputDrain::OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+                         std::shared_ptr<sirius::exec::exchange_inbox> exchange,
+                         std::shared_ptr<sirius::exec::ring_exchange> ring)
+  : stream_(std::move(stream)), exchange_(std::move(exchange)), ring_(std::move(ring))
+{
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> OutputDrain::export_ring_next(
+  std::uint32_t timeout_ms,
+  bool& ended,
+  std::uint64_t& token,
+  std::uint64_t& rows,
+  std::uint64_t& stream_bytes) const
+{
+  if (!ring_) {
+    throw sirius::invalid_input_exception("OutputDrain: this context has no ring exchange");
+  }
+  using availability  = sirius::exec::batch_stream::availability;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  ended               = false;
+  for (;;) {
+    // A batch whose export ran out of GPU memory last time goes first, whatever the stream says.
+    std::shared_ptr<cucascade::data_batch> batch = std::move(ring_retry_);
+    ring_retry_.reset();
+    if (!batch) {
+      switch (stream_->classify()) {
+        case availability::END_OF_STREAM: ended = true; return nullptr;
+        case availability::HAS_DATA:
+          // Rethrows the fragment's error; nullptr only if another consumer took the batch.
+          batch = stream_->try_pull();
+          break;
+        case availability::WAITING: {
+          auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+          if (left.count() <= 0) { return nullptr; }
+          static_cast<void>(stream_->wait_for(left));
+          continue;
+        }
+      }
+      if (!batch) { continue; }
+    }
+    auto const keep = [&](auto kept) { ring_retry_ = std::move(kept); };
+    if (auto header = export_to_ring(*ring_, std::move(batch), keep, token, rows, stream_bytes)) {
+      return header;
+    }
+    // A batch without rows is not sent.
+  }
+}
+
+void Context::interrupt() noexcept { impl_->gate->interrupt(); }
+
+std::unique_ptr<Interrupter> Context::interrupter() const
+{
+  return std::unique_ptr<Interrupter>(new Interrupter(impl_->gate));
+}
+
+Interrupter::Interrupter(std::shared_ptr<Gate> gate) : gate_(std::move(gate)) {}
+
+Interrupter::~Interrupter() = default;
+
+void Interrupter::interrupt() const noexcept { gate_->interrupt(); }
+
+std::unique_ptr<std::string> Context::pin_table(const std::string& path,
+                                                const std::string& tier,
+                                                const std::string& name,
+                                                const std::string& cols_joined,
+                                                const std::string& format,
+                                                const std::string& schema_name)
+{
+  duckdb::vector<duckdb::Value> positional;
+  if (!path.empty()) { positional.emplace_back(path); }
+
+  duckdb::named_parameter_map_t named;
+  if (!tier.empty()) { named["tier"] = duckdb::Value(tier); }
+  if (!name.empty()) { named["name"] = duckdb::Value(name); }
+  if (!cols_joined.empty()) {
+    duckdb::vector<duckdb::Value> cols;
+    std::size_t start = 0;
+    while (start <= cols_joined.size()) {
+      auto end = cols_joined.find('\n', start);
+      if (end == std::string::npos) { end = cols_joined.size(); }
+      if (end > start) { cols.emplace_back(cols_joined.substr(start, end - start)); }
+      start = end + 1;
+    }
+    named["cols"] = duckdb::Value::LIST(duckdb::LogicalType::VARCHAR, std::move(cols));
+  }
+  if (!format.empty()) { named["format"] = duckdb::Value(format); }
+  if (!schema_name.empty()) { named["schema_name"] = duckdb::Value(schema_name); }
+
+  // The relation runs through the connection's ordinary (autocommit) query path —
+  // the same way the extension's `CALL pin_table(...)` executes — so bind
+  // validation, transactions, and the pin execution window all behave identically.
+  std::lock_guard<std::mutex> lock(impl_->conn_mutex);
+  auto result = impl_->conn->TableFunction("pin_table", positional, named)->Execute();
+  if (result->HasError()) { result->ThrowError(); }
+  while (result->Fetch()) {}
+
+  return std::make_unique<std::string>("pinned '" + name + "' tier=" + tier);
+}
+
+std::unique_ptr<std::string> Context::unpin_table(const std::string& name)
+{
+  duckdb::vector<duckdb::Value> positional;
+  positional.emplace_back(name);
+  std::lock_guard<std::mutex> lock(impl_->conn_mutex);
+  auto result = impl_->conn->TableFunction("unpin_table", positional)->Execute();
+  if (result->HasError()) { result->ThrowError(); }
+  while (result->Fetch()) {}
+  return std::make_unique<std::string>("unpinned '" + name + "'");
+}
+
+std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
+
+std::unique_ptr<Context> make_context_from_config(const std::string& config_path)
+{
+  return std::make_unique<Context>(config_path);
+}
+
+std::unique_ptr<Context> make_context_from_config(const std::string& config_path,
+                                                  std::shared_ptr<ObjectStoreConfig> cfg)
+{
+  // Reject invalid settings before bring_up(). Publication rechecks them afterward,
+  // so a CA file that changes during bring-up can still cause a later rejection.
+  auto config = config_path.empty() ? sirius::parsed_sirius_config{}
+                                    : sirius::parsed_sirius_config::from_file(config_path);
+  if (cfg) { check_object_store(*cfg); }
+  auto impl = std::make_unique<Context::Impl>();
+  impl->bring_up(config);
+  if (cfg) { publish_snapshot(impl->object_store, cfg); }
+  return std::unique_ptr<Context>(new Context(std::move(impl)));
+}
+
+std::unique_ptr<Context> make_context_with_ring(const std::string& config_path,
+                                                std::uint64_t frame_bytes,
+                                                std::uint64_t send_bytes,
+                                                std::uint64_t recv_bytes,
+                                                double gpu_landing_fraction,
+                                                std::uint64_t host_landing_bytes,
+                                                std::uint64_t disk_writers)
+{
+  return std::make_unique<Context>(
+    config_path,
+    Context::RingOptions{
+      frame_bytes, send_bytes, recv_bytes, gpu_landing_fraction, host_landing_bytes, disk_writers});
+}
+
+// ---------------------------------------------------------------------------
+// Fragment
+// ---------------------------------------------------------------------------
+
+// PIMPL around one starrocks_streaming_fragment.
+struct Fragment::Impl {
+  explicit Impl(Context::Impl& ctx) : ctx(ctx) {}
+
+  Context::Impl& ctx;
+
+  // An input stream declared before build(). type_names are parsed at build(), inside a
+  // transaction, because parsing may need a catalog lookup.
+  struct declared_input {
+    std::vector<std::string> names;
+    std::vector<std::string> type_names;
+    std::set<sirius::exec::sender_id_t> expected_senders;
+    std::optional<std::uint64_t> estimated_rows;
+  };
+
+  std::map<sirius::exec::stream_id_t, declared_input> inputs;
+  std::vector<sirius::exec::stream_id_t> outputs;
+  bool broadcast_outputs{false};
+  std::vector<int> hash_key_columns;
+
+  // One starrocks_streaming_fragment for both terminals. Empty outputs is a RESULT_COLLECTOR.
+  std::unique_ptr<sirius::exec::starrocks_streaming_fragment> fragment;
+  // Scope set captured for this execution. An empty set is unconfigured; a null handle
+  // means no capture has been stored.
+  std::shared_ptr<const sirius::object_store_scope::scope_set> object_store;
+
+  // Per output stream, a batch pulled for export_ring() whose export ran out of GPU memory
+  // (bringing a spilled batch back): it is exported first on the next call.
+  std::map<std::uint64_t, std::shared_ptr<cucascade::data_batch>> ring_pending;
+
+  void require_not_built(const char* what) const
+  {
+    if (fragment) {
+      throw sirius::invalid_input_exception(std::string("Fragment: ") + what +
+                                            " must be called before build()");
+    }
+  }
+
+  void require_built(const char* what) const
+  {
+    if (!fragment) {
+      throw sirius::invalid_input_exception(std::string("Fragment: build() must run before ") +
+                                            what);
+    }
+  }
+
+  std::map<sirius::exec::stream_id_t, sirius::exec::starrocks_stream_input_spec> resolve_inputs()
+    const
+  {
+    std::map<sirius::exec::stream_id_t, sirius::exec::starrocks_stream_input_spec> resolved;
+    for (const auto& [id, declared] : inputs) {
+      sirius::exec::starrocks_stream_input_spec spec;
+      spec.names = declared.names;
+      spec.types.reserve(declared.type_names.size());
+      for (const auto& type_name : declared.type_names) {
+        spec.types.push_back(
+          sirius::from_duckdb(duckdb::TransformStringToLogicalType(type_name, *ctx.conn->context)));
+      }
+      spec.expected_senders = declared.expected_senders;
+      if (spec.expected_senders.empty()) { spec.expected_senders.insert(0); }
+      spec.estimated_rows = declared.estimated_rows;
+      resolved.emplace(id, std::move(spec));
+    }
+    return resolved;
+  }
+
+  // Push a copied batch, on the GPU, into input `stream_id`; push() checks it against the
+  // declared schema.
+  void push_copy(std::uint64_t stream_id, std::shared_ptr<cucascade::data_batch> batch)
+  {
+    if (!fragment->push(stream_id, std::move(batch))) {
+      throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                            " refused a copied batch; it had already ended");
+    }
+  }
+
+  // CREATE OR REPLACE VIEW sirius_stream_<id> AS SELECT * FROM sirius_stream_source(<id>)
+  // Needs an open transaction, and the ids declared in the stream_bind_catalog so the view's
+  // SELECT binds: call it from the plan source, which starrocks_streaming_fragment::build() runs
+  // after declaring them.
+  void create_stream_views()
+  {
+    for (const auto& [id, _] : inputs) {
+      const auto view_name = stream_view_name_of(id);
+      const auto sql       = "CREATE OR REPLACE VIEW main." + view_name + " AS SELECT * FROM " +
+                       std::string(sirius::exec::kStreamSourceFunctionName) + "(" +
+                       std::to_string(id) + ")";
+      auto res = ctx.conn->Query(sql);
+      if (res->HasError()) { res->ThrowError(); }
+    }
+  }
+};
+
+Fragment::Fragment(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+Fragment::~Fragment() = default;
+
+void Fragment::declare_input_column(std::uint64_t stream_id,
+                                    const std::string& name,
+                                    const std::string& type)
+{
+  impl_->require_not_built("declare_input_column");
+  auto& d = impl_->inputs[stream_id];
+  d.names.push_back(name);
+  d.type_names.push_back(type);
+}
+
+void Fragment::declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id)
+{
+  impl_->require_not_built("declare_input_sender");
+  impl_->inputs[stream_id].expected_senders.insert(sender_id);
+}
+
+void Fragment::declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows)
+{
+  impl_->require_not_built("declare_input_cardinality");
+  impl_->inputs[stream_id].estimated_rows = rows;
+}
+
+void Fragment::declare_output(std::uint64_t stream_id)
+{
+  impl_->require_not_built("declare_output");
+  auto& outs = impl_->outputs;
+  if (std::find(outs.begin(), outs.end(), stream_id) != outs.end()) {
+    throw sirius::invalid_input_exception("Fragment: duplicate output stream id " +
+                                          std::to_string(stream_id));
+  }
+  outs.push_back(stream_id);
+}
+
+void Fragment::declare_output_broadcast()
+{
+  impl_->require_not_built("declare_output_broadcast");
+  if (!impl_->hash_key_columns.empty()) {
+    throw sirius::invalid_input_exception(
+      "Fragment: broadcast and hash-partitioned output are mutually exclusive");
+  }
+  impl_->broadcast_outputs = true;
+}
+
+void Fragment::declare_output_hash_key(std::uint32_t column_index)
+{
+  impl_->require_not_built("declare_output_hash_key");
+  if (impl_->broadcast_outputs) {
+    throw sirius::invalid_input_exception(
+      "Fragment: broadcast and hash-partitioned output are mutually exclusive");
+  }
+  impl_->hash_key_columns.push_back(static_cast<int>(column_index));
+}
+
+void Fragment::build(const std::string& substrait_plan)
+{
+  impl_->require_not_built("build");
+
+  std::unique_ptr<sirius::exec::starrocks_streaming_fragment> fragment;
+  // The attempt owns its capture and its partial fragment: both outlive the transaction below
+  // and are committed to the Fragment only after it succeeds, so a failed attempt never leaves
+  // a stored capture behind and nothing captured earlier is released under conn_mutex.
+  std::shared_ptr<const sirius::object_store_scope::scope_set> captured;
+  // Type-name parsing, CREATE VIEW, and Substrait lowering all need an active transaction. A
+  // failure rolls back the views, so a half-declared fragment leaves nothing behind.
+  in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
+    // Captured once the transaction is held and before any binding consumes credentials.
+    captured = impl_->ctx.object_store.capture();
+    run_capture_pause_hook();
+    sirius::exec::starrocks_fragment_spec spec;
+    spec.inputs      = impl_->resolve_inputs();
+    spec.outputs     = impl_->outputs;
+    spec.plan_source = [this, &substrait_plan, captured](duckdb::ClientContext&) {
+      impl_->create_stream_views();
+      return lower_substrait(*impl_->ctx.conn, substrait_plan, *captured);
+    };
+    // starrocks_streaming_fragment rejects a partition mode on fewer than two outputs.
+    if (impl_->broadcast_outputs) {
+      sirius::op::partition_spec broadcast;
+      broadcast.mode    = sirius::op::partition_mode::broadcast;
+      spec.partitioning = std::move(broadcast);
+    } else if (!impl_->hash_key_columns.empty()) {
+      // key_cast_types left empty. starrocks_streaming_fragment::build() fills them from output
+      // types.
+      sirius::op::partition_spec hash;
+      hash.mode         = sirius::op::partition_mode::hash;
+      hash.key_columns  = impl_->hash_key_columns;
+      spec.partitioning = std::move(hash);
+    }
+
+    fragment = std::make_unique<sirius::exec::starrocks_streaming_fragment>(
+      *impl_->ctx.conn->context, std::move(spec));
+    fragment->build();
+  });
+  impl_->object_store = std::move(captured);
+  impl_->fragment     = std::move(fragment);
+}
+
+std::size_t Fragment::relay_from(Fragment& source,
+                                 std::uint64_t source_stream_id,
+                                 std::uint64_t input_stream_id,
+                                 std::uint32_t sender_id)
+{
+  impl_->require_built("relay_from()");
+  if (!source.impl_->fragment) {
+    throw sirius::invalid_input_exception(
+      "Fragment: relay_from() requires the source fragment to have been built");
+  }
+  return impl_->fragment->relay_from(
+    *source.impl_->fragment, source_stream_id, input_stream_id, sender_id);
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_ring(std::uint64_t stream_id,
+                                                                 std::uint64_t& token,
+                                                                 std::uint64_t& rows,
+                                                                 std::uint64_t& stream_bytes)
+{
+  impl_->require_built("export_ring()");
+  if (!impl_->ctx.ring) {
+    throw sirius::invalid_input_exception("Fragment: this context has no ring exchange");
+  }
+  for (;;) {
+    std::shared_ptr<cucascade::data_batch> batch;
+    if (auto pending = impl_->ring_pending.find(stream_id); pending != impl_->ring_pending.end()) {
+      batch = std::move(pending->second);
+      impl_->ring_pending.erase(pending);
+    } else if (auto pulled = impl_->fragment->pull(stream_id)) {
+      batch = std::move(*pulled);
+    } else {
+      return nullptr;
+    }
+    auto const keep = [&](auto kept) { impl_->ring_pending[stream_id] = std::move(kept); };
+    auto& ring      = *impl_->ctx.ring;
+    if (auto header = export_to_ring(ring, std::move(batch), keep, token, rows, stream_bytes)) {
+      return header;
+    }
+  }
+}
+
+std::unique_ptr<OutputDrain> Fragment::output_drain(std::uint64_t stream_id) const
+{
+  impl_->require_built("output_drain()");
+  if (!impl_->ctx.ring) {
+    throw sirius::invalid_input_exception("Fragment: output_drain() needs a ring exchange");
+  }
+  return std::make_unique<OutputDrain>(
+    impl_->fragment->output_stream(stream_id), impl_->ctx.exchange, impl_->ctx.ring);
+}
+
+void Fragment::output_key_stats(std::uint64_t stream_id,
+                                std::uint32_t column,
+                                std::uint64_t& rows,
+                                std::uint64_t& distinct,
+                                std::int64_t& min,
+                                std::int64_t& max) const
+{
+  impl_->require_built("output_key_stats()");
+  auto& exchange = impl_->ctx.require_exchange();
+  sirius::exec::exchange_inbox::key_stats stats{rows, distinct, min, max};
+  for (auto const& batch : impl_->fragment->peek_output(stream_id)) {
+    exchange.add_key_stats(*batch, static_cast<int>(column), stats);
+  }
+  rows     = stats.rows;
+  distinct = stats.distinct;
+  min      = stats.min;
+  max      = stats.max;
+}
+
+std::size_t Fragment::copy_output_column(Fragment& source,
+                                         std::uint64_t source_stream_id,
+                                         std::uint64_t input_stream_id,
+                                         std::uint32_t column)
+{
+  impl_->require_built("copy_output_column()");
+  source.impl_->require_built("copy_output_column()");
+  auto& exchange     = impl_->ctx.require_exchange();
+  std::size_t copied = 0;
+  for (auto const& batch : source.impl_->fragment->peek_output(source_stream_id)) {
+    impl_->push_copy(input_stream_id, exchange.copy_column(*batch, static_cast<int>(column)));
+    ++copied;
+  }
+  return copied;
+}
+
+void Fragment::copy_received_column(std::uint64_t input_stream_id,
+                                    std::uint64_t token,
+                                    std::uint32_t column)
+{
+  impl_->require_built("copy_received_column()");
+  auto& exchange = impl_->ctx.require_exchange();
+  impl_->push_copy(input_stream_id,
+                   exchange.copy_column(*exchange.peek_batch(token), static_cast<int>(column)));
+}
+
+void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
+{
+  impl_->require_built("push_received()");
+  auto& exchange = impl_->ctx.require_exchange();
+  // A batch dropped by a refused push is freed on the device its buffers live on.
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{exchange.device()}};
+  // Refuses an undeclared input or a running fragment before the token is consumed.
+  impl_->fragment->require_pushable(stream_id);
+  // push() checks the columns of a batch on the GPU. A batch that spilled to host goes in
+  // unchecked, and nothing checks it when a task brings it back: its columns are the ones its
+  // transport landed, and the spill keeps them.
+  auto batch = exchange.take_batch(token);
+  if (!impl_->fragment->push(stream_id, std::move(batch))) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused a received batch; it had already ended");
+  }
+}
+
+void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
+{
+  impl_->require_built("close_input()");
+  impl_->fragment->close_input(stream_id, sender_id);
+}
+
+void Fragment::run()
+{
+  impl_->require_built("run()");
+  // Scans read DuckDB MVCC state through the active transaction.
+  in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
+    interruptible_run interruptible(*impl_->ctx.gate);
+    impl_->fragment->run();
+  });
+}
+
+void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)
+{
+  impl_->require_built("result_to_arrow()");
+  auto result = impl_->fragment->take_result();
+  sirius::exec::export_arrow_result(
+    std::move(result), *reinterpret_cast<ArrowArrayStream*>(out_stream_addr), kArrowBatchSize);
+}
+
+std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
+{
+  if (!impl_->fragment) { return 0; }
+  return impl_->fragment->output_batch_count(stream_id);
+}
+
+std::uint64_t Fragment::output_row_count(std::uint64_t stream_id) const
+{
+  impl_->require_built("output_row_count()");
+  return impl_->fragment->output_row_count(stream_id);
+}
+
+std::unique_ptr<std::vector<std::string>> Fragment::output_types() const
+{
+  impl_->require_built("output_types()");
+  if (impl_->fragment->is_result()) {
+    throw sirius::invalid_input_exception(
+      "Fragment: output_types() is only valid on an intermediate fragment with output streams");
+  }
+  auto types = std::make_unique<std::vector<std::string>>();
+  types->reserve(impl_->fragment->sink_types().size());
+  for (const auto& type : impl_->fragment->sink_types()) {
+    types->push_back(type.to_string());
+  }
+  return types;
+}
+
+std::unique_ptr<Fragment> make_fragment(Context& context)
+{
+  return std::unique_ptr<Fragment>(new Fragment(std::make_unique<Fragment::Impl>(*context.impl_)));
+}
+
+std::unique_ptr<std::string> stream_view_name(std::uint64_t stream_id)
+{
+  return std::make_unique<std::string>(stream_view_name_of(stream_id));
+}
+
+namespace testing {
+
+void set_capture_pause_hook(std::function<void()> hook)
+{
+  std::shared_ptr<const std::function<void()>> replacement;
+  if (hook) { replacement = std::make_shared<const std::function<void()>>(std::move(hook)); }
+  {
+    std::lock_guard lock(capture_pause_mutex);
+    capture_pause_hook.swap(replacement);
+  }
+  // `replacement` now owns the retired callable and releases it here, after the lock.
+}
+
+void set_transaction_entry_hook(std::function<void()> hook)
+{
+  auto next = hook ? std::make_shared<const std::function<void()>>(std::move(hook)) : nullptr;
+  std::shared_ptr<const std::function<void()>> retired;
+  {
+    std::lock_guard lock(transaction_entry_mutex);
+    retired = std::exchange(transaction_entry_hook, std::move(next));
+  }
+}
+
+}  // namespace testing
+
+}  // namespace sirius::starrocks_ffi

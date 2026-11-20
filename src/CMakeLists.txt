@@ -17,6 +17,7 @@ target_sources(
           sirius_engine.cpp
           sirius_extension.cpp
           sirius_ffi.cpp
+          starrocks_ffi.cpp
           sirius_interface.cpp
           sirius_sql_rewrite.cpp)
 

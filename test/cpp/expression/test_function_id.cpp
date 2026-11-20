@@ -43,7 +43,7 @@ static_assert(std::is_enum_v<function_id>, "sirius::function_id must be an enum 
 static_assert(sizeof(function_id) == 2,
               "sirius::function_id is uint16_t-backed (D-01 — locked ABI).");
 static_assert(static_cast<uint16_t>(function_id::negate) + 1 == 35,
-              "sirius::function_id has exactly 35 entries (D-01 — locked ABI).");
+              "The 35 original function IDs through negate remain stable (D-01).");
 
 // ============================================================================
 // Round-trip every function_id entry through the name mappers
@@ -443,6 +443,17 @@ TEST_CASE("ast_function_id - argument counts follow the GPU handlers", "[ast_fun
 TEST_CASE("ast_function_id - to_duckdb_function_name rejects an id outside the enum",
           "[ast_function_id]")
 {
-  auto const past_end = static_cast<function_id>(static_cast<uint16_t>(function_id::negate) + 1);
+  auto const past_end =
+    static_cast<function_id>(static_cast<uint16_t>(function_id::decimal_divide) + 1);
   REQUIRE_THROWS_AS(to_duckdb_function_name(past_end), sirius::internal_exception);
+}
+
+TEST_CASE("StarRocks decimal division keeps existing function IDs and checks arity",
+          "[ast_function_id]")
+{
+  STATIC_REQUIRE(static_cast<uint16_t>(function_id::negate) == 34);
+  STATIC_REQUIRE(static_cast<uint16_t>(function_id::decimal_divide) == 35);
+  REQUIRE(from_duckdb_function_name("sirius_decimal_divide", 3) == function_id::decimal_divide);
+  REQUIRE_FALSE(from_duckdb_function_name("sirius_decimal_divide", 2));
+  REQUIRE(to_duckdb_function_name(function_id::decimal_divide) == "sirius_decimal_divide");
 }

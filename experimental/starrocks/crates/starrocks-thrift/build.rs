@@ -28,11 +28,14 @@ fn main() {
     fs::create_dir_all(&gen_dir).expect("failed to create thrift output directory");
 
     println!("cargo:rerun-if-env-changed=THRIFT");
+    println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-changed={}", thrift_dir.display());
 
     let thrift = find_thrift(&workspace_dir).expect(
         "could not find thrift compiler; set THRIFT or install the experimental/starrocks pixi cn env",
     );
+
+    println!("cargo:rerun-if-changed={}", thrift.display());
 
     let thrift_files =
         collect_thrift_files(&thrift_dir).expect("failed to list StarRocks thrift files");
@@ -65,19 +68,16 @@ fn main() {
         .expect("failed to write generated thrift module index");
 }
 
-/// Locates the Thrift compiler via `$THRIFT`, the pixi envs, then `$PATH`.
+/// Locates the Thrift compiler via `$THRIFT`, the active environment, then the CN environment.
 fn find_thrift(workspace_dir: &Path) -> Option<PathBuf> {
     if let Ok(path) = env::var("THRIFT") {
         return Some(PathBuf::from(path));
     }
 
-    [
-        workspace_dir.join(".pixi/envs/cn/bin/thrift"),
-        workspace_dir.join(".pixi/envs/fe/bin/thrift"),
-    ]
-    .into_iter()
-    .find(|candidate| candidate.exists())
-    .or_else(|| find_in_path("thrift"))
+    find_in_path("thrift").or_else(|| {
+        let compiler = workspace_dir.join(".pixi/envs/cn/bin/thrift");
+        compiler.is_file().then_some(compiler)
+    })
 }
 
 /// Returns the first directory in `$PATH` containing `binary`.

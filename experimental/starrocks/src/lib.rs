@@ -46,19 +46,42 @@ use tracing::{debug, info, instrument, warn};
 
 mod brpc;
 mod compute_node_service;
+mod deadlines;
 #[cfg(feature = "sirius-engine")]
 mod engine;
+mod fe_report;
 mod file_schema;
 mod fragment_executor;
+mod local_exchange;
+// The sender half is used only by the NIXL transport.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod nixl_chunk;
+#[cfg(any(test, feature = "sirius-engine"))]
+mod parked_registry;
 mod proto;
 mod prpc;
+mod recent_queries;
 mod result_encoder;
 mod result_store;
+#[cfg(feature = "nixl-transport")]
+mod ring_nixl;
+// The loop runs only with NIXL; without it the tests drive it over an in-process fabric.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod ring_transport;
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+mod ring_wire;
+// The run record is used only by the engine; pending frees by every executor.
+#[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
+mod running_query;
+mod runtime_filters;
 
 pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
-pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use fragment_executor::{FragmentExecutor, FragmentResult, PendingFrees, StubExecutor};
+pub use nixl_chunk::NixlEndpoint;
+#[cfg(feature = "nixl-transport")]
+pub use ring_nixl::{ring_options_from_env, start_ring_transport};
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 
@@ -183,8 +206,19 @@ impl Default for ComputeNodeConfig {
     }
 }
 
+/// StarRocks release and commit of the submodule the CN was built from (see `build.rs`). The
+/// thrift plan structures change between releases, so the CN runs only with this release's FE.
+const STARROCKS_RELEASE: &str = env!("SIRIUS_CN_STARROCKS_RELEASE");
+const STARROCKS_COMMIT: &str = env!("SIRIUS_CN_STARROCKS_COMMIT");
+
+/// The version the heartbeat reports, shown by `SHOW COMPUTE NODES`, e.g.
+/// `sirius-starrocks-cn/0.1.0 (starrocks 4.1.3, 8a8e186)`.
 fn default_compute_node_version() -> String {
-    format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    format!(
+        "{}/{} (starrocks {STARROCKS_RELEASE}, {STARROCKS_COMMIT})",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn compute_node_registration_sql(host: &Host, heartbeat_port: u16) -> String {
@@ -1063,9 +1097,37 @@ pub fn report_to_frontend_once(
     };
 
     // FE thrift address comes from TMasterInfo.network_address in heartbeat.
-    let frontend = report.frontend_address.clone();
-    // Resolve and connect with bounded timeouts so an unreachable or accept-but-never-reply FE
-    // cannot wedge this blocking call — and therefore the whole report loop — indefinitely.
+    let mut client = frontend_client(&report.frontend_address)?;
+    let result = client
+        .report(report.request)
+        .map_err(|err| anyhow!("failed to report compute node inventory to FE: {err}"))?;
+    // The Thrift round-trip succeeding does not mean the FE accepted the report; a non-OK
+    // status (e.g. unrecognized node or malformed payload) must surface as an error instead of
+    // being silently logged as success by the caller.
+    if result.status.status_code != TStatusCode::OK {
+        bail!(
+            "FE rejected compute node report (status {:?}): {}",
+            result.status.status_code,
+            result
+                .status
+                .error_msgs
+                .as_ref()
+                .map(|messages| messages.join("; "))
+                .unwrap_or_default()
+        );
+    }
+    Ok(Some(result))
+}
+
+/// A `FrontendService` client on a strict binary protocol, as the FE serves it.
+pub(crate) type FrontendClient = FrontendServiceSyncClient<
+    TBinaryInputProtocol<TBufferedReadTransport<thrift::transport::ReadHalf<TTcpChannel>>>,
+    TBinaryOutputProtocol<TBufferedWriteTransport<thrift::transport::WriteHalf<TTcpChannel>>>,
+>;
+
+/// Connects to the FE's thrift service at `frontend` with bounded timeouts, so an unreachable
+/// or accept-but-never-reply FE cannot wedge the blocking caller indefinitely.
+pub(crate) fn frontend_client(frontend: &types::TNetworkAddress) -> Result<FrontendClient> {
     let socket_addrs: Vec<SocketAddr> = (frontend.hostname.as_str(), frontend.port as u16)
         .to_socket_addrs()
         .with_context(|| {
@@ -1077,7 +1139,7 @@ pub fn report_to_frontend_once(
         .collect();
     // Try every resolved address (e.g. an IPv4/IPv6 dual-stack or round-robin host) with a
     // bounded connect, matching TcpStream::connect's multi-address behavior while still
-    // enforcing a timeout so an unresponsive FE cannot wedge the report loop.
+    // enforcing a timeout.
     let mut stream = None;
     let mut last_err: Option<std::io::Error> = None;
     for socket_addr in &socket_addrs {
@@ -1115,27 +1177,10 @@ pub fn report_to_frontend_once(
     let write_transport = TBufferedWriteTransport::new(write_channel);
     let input_protocol = TBinaryInputProtocol::new(read_transport, true);
     let output_protocol = TBinaryOutputProtocol::new(write_transport, true);
-    let mut client = FrontendServiceSyncClient::new(input_protocol, output_protocol);
-
-    let result = client
-        .report(report.request)
-        .map_err(|err| anyhow!("failed to report compute node inventory to FE: {err}"))?;
-    // The Thrift round-trip succeeding does not mean the FE accepted the report; a non-OK
-    // status (e.g. unrecognized node or malformed payload) must surface as an error instead of
-    // being silently logged as success by the caller.
-    if result.status.status_code != TStatusCode::OK {
-        bail!(
-            "FE rejected compute node report (status {:?}): {}",
-            result.status.status_code,
-            result
-                .status
-                .error_msgs
-                .as_ref()
-                .map(|messages| messages.join("; "))
-                .unwrap_or_default()
-        );
-    }
-    Ok(Some(result))
+    Ok(FrontendServiceSyncClient::new(
+        input_protocol,
+        output_protocol,
+    ))
 }
 
 /// Builds the truthful "empty CN" report payload expected by `FrontendService.report`.
@@ -1324,7 +1369,7 @@ fn resolve_host_ips(host: &str) -> Vec<IpAddr> {
 /// shared IP is required. Resolution failure on either side is treated as inconclusive and
 /// trusted, so a transient DNS hiccup never drops a legitimate FE address; only a confident
 /// mismatch (both resolve, no shared IP) is rejected.
-fn frontend_host_trusted(expected_host: &str, advertised_host: &str) -> bool {
+pub(crate) fn frontend_host_trusted(expected_host: &str, advertised_host: &str) -> bool {
     if expected_host == advertised_host {
         return true;
     }
@@ -1403,6 +1448,40 @@ mod tests {
             Some(types::TNetworkAddress::new("127.0.0.1".to_string(), 9020))
         );
         assert!(snapshot.last_heartbeat_ms.is_some());
+    }
+
+    /// Verifies the heartbeat reports the StarRocks release the CN was built for.
+    #[test]
+    fn heartbeat_version_names_the_starrocks_release() {
+        let handler = ComputeNodeHeartbeatHandler::new(
+            ComputeNodeConfig::default(),
+            SharedHeartbeatState::new(),
+            None,
+        );
+
+        let result = handler.handle_heartbeat(master(7)).unwrap();
+
+        assert_eq!(
+            result.backend_info.version.as_deref(),
+            Some(
+                format!(
+                    "sirius-starrocks-cn/{} (starrocks {STARROCKS_RELEASE}, {STARROCKS_COMMIT})",
+                    env!("CARGO_PKG_VERSION")
+                )
+                .as_str()
+            )
+        );
+        // build.rs read the submodule: a release number, and a short commit unless git is missing.
+        assert!(
+            STARROCKS_RELEASE.starts_with(|c: char| c.is_ascii_digit()),
+            "{STARROCKS_RELEASE}"
+        );
+        assert!(
+            STARROCKS_COMMIT == "unknown"
+                || (STARROCKS_COMMIT.len() == 7
+                    && STARROCKS_COMMIT.chars().all(|c| c.is_ascii_hexdigit())),
+            "{STARROCKS_COMMIT}"
+        );
     }
 
     /// Verifies equal or increasing heartbeat epochs keep the handler state current.

@@ -50,6 +50,7 @@
 #include "planner/scan_returned_types.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/substrait_scan_ranges.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -588,7 +589,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   } else if (!marked_decline && sirius_state && compressed_materialization_on) {
     auto const files = resolve_parquet_scan_file_paths(
       op.function.GetName().GetIdentifierName(), op.bind_data.get(), op.parameters);
-    if (!files.empty()) {
+    auto const ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+      sirius::planner::scan_byte_ranges_state::kStateKey);
+    bool const ranged = ranges && std::any_of(files.begin(), files.end(), [&](auto const& file) {
+                          return ranges->has(file);
+                        });
+    if (!files.empty() && !ranged) {
       pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
       pinned       = pinned_owner.get();
     }

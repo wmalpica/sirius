@@ -27,3 +27,5 @@ target_sources(
           vss/cudf_raft_interop.cu
           vss/brute_force_search.cu
           vss/ivf_flat_index.cu)
+
+target_sources(sirius_objects PRIVATE decimal_divide.cu)

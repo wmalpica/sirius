@@ -33,7 +33,7 @@ trap cleanup EXIT INT TERM
 starrocks/output/fe/bin/start_fe.sh --logconsole &
 fe_pid="$!"
 
-target/release/sirius-starrocks-cn &
+(source scripts/cn-env.sh && exec target/release/sirius-starrocks-cn) &
 cn_pid="$!"
 
 wait -n "${fe_pid}" "${cn_pid}"
@@ -49,18 +49,22 @@ client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "
 
 [feature.cn.dependencies]
 rust = "*"
-thrift-compiler = "*"
+thrift-compiler = "0.22.*"
 
 [feature.cn.tasks]
+cn-nixl-build = {cmd = "pixi run --manifest-path ../../pixi.toml bash scripts/build-cn-nixl.sh", depends-on = ["engine-build"], description = "Build a separate shared NIXL SDK from main's pinned source for the Rust transport"}
+
+cn-build-local = {cmd = "cargo build --release -p sirius-starrocks-cn --no-default-features --features sirius-engine", depends-on = ["engine-build"], description = "Build the real engine compute node for exchanges on one node, without NIXL"}
+
 # Build libsirius from source via the repo-root build (creates build/release, which
 # sirius-ffi uses through sirius-sys by default).
 engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",description = "Build the Sirius engine (libsirius) from source for the CN to link"}
 
 # Engine-linked CN (default `sirius-engine` feature); needs the engine artifact and
 # the `engine` feature's toolchain/libs (in the default env).
-cn-build = {cmd = "cargo build --release -p sirius-starrocks-cn",depends-on = ["engine-build"],description = "Build the engine-linked StarRocks CN release binary"}
-cn-test = {cmd = "cargo test -p sirius-starrocks-cn",depends-on = ["engine-build"],description = "Run engine-linked StarRocks CN tests"}
-cn-run = {cmd = "cargo run -p sirius-starrocks-cn --",depends-on = ["engine-build"],description = "Run the engine-linked StarRocks CN with local FE defaults"}
+cn-build = {cmd = "bash -c 'source scripts/cn-env.sh && cargo build --release -p sirius-starrocks-cn'",depends-on = ["cn-nixl-build"],description = "Build the engine-linked StarRocks CN release binary"}
+cn-test = {cmd = "bash -c 'source scripts/cn-env.sh && cargo test -p sirius-starrocks-cn'",depends-on = ["cn-nixl-build"],description = "Run engine-linked StarRocks CN tests"}
+cn-run = {cmd = "bash -c 'source scripts/cn-env.sh && cargo run -p sirius-starrocks-cn -- \"$@\"' _",depends-on = ["cn-nixl-build"],description = "Run the engine-linked StarRocks CN with local FE defaults"}
 
 # Pure-Rust path (no engine, build tree, or GPU). What CI runs.
 cn-test-no-engine = {cmd = "cargo test -p sirius-starrocks-cn --no-default-features",description = "Run Rust StarRocks CN tests without the embedded Sirius engine"}
@@ -88,6 +92,10 @@ openssl = "*"
 libcurl = "*"
 
 [feature.fe.dependencies]
+bison = ">=3.8"
+cmake = ">=3.16"
+cxx-compiler = "*"
+flex = "*"
 bash = "*"
 coreutils = "*"
 findutils = "*"
@@ -101,11 +109,13 @@ maven = ">=3.9"
 openjdk = "17.*"
 python = "3.11.*"
 sed = "*"
-thrift-compiler = "0.20.*"
+
 util-linux = "*"
 which = "*"
 
 [feature.fe.tasks]
+fe-thrift-build = {cmd = "python scripts/build_fe_thrift.py", description = "Build the compiler matching the FE Java Thrift runtime"}
+
 fe-clean = {cmd = """
 bash -lc 'set -e
 rm -rf output/fe output/LICENSE.txt output/NOTICE.txt fe/*/target fe/plugin/*/target java-extensions/target java-extensions/hadoop-ext/target
@@ -135,7 +145,8 @@ touch "${thirdparty}/installed/llvm/lib/libLLVMInstCombine.a"
 STARROCKS_THIRDPARTY="${thirdparty}" ./build.sh --fe --with-maven-batch-mode ON
 cp ../conf/fe.conf output/fe/conf/fe.conf'
 """,
-cwd = "starrocks",inputs = [
+cwd = "starrocks",depends-on = ["fe-thrift-build"],inputs = [
+    "scripts/build_fe_thrift.py",
     "conf/fe.conf",
     "starrocks/build.sh",
     "starrocks/env.sh",

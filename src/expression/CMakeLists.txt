@@ -8,3 +8,5 @@ target_sources(
           function_id.cpp
           join_condition.cpp
           value.cpp)
+
+target_sources(sirius_objects PRIVATE decimal_divide_function.cpp)

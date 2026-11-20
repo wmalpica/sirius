@@ -117,3 +117,5 @@ target_sources(
           scan/equality_delete_mask.cu)
 
 add_subdirectory(scan/arrow)
+
+target_sources(sirius_objects PRIVATE starrocks_physical_streaming_sink.cpp)

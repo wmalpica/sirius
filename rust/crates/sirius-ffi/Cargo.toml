@@ -7,6 +7,7 @@ license = "Apache-2.0"
 publish = false
 
 [features]
+starrocks-experimental = []
 static = ["sirius-sys/static"]
 
 [dependencies]
