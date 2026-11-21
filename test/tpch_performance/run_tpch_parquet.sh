@@ -37,6 +37,7 @@
 #   SIRIUS_CONFIG_FILE - path to Sirius config file (required for sirius engine)
 #   OUTPUT_DIR         - directory to save per-query results (optional)
 #   TIMING_CSV         - path to write per-query timing CSV (optional)
+#   TPCH_QUERY_LABEL_PREFIX - label Sirius queries with PREFIX_q<N>_iter<I> (optional)
 
 set -uo pipefail
 
@@ -173,6 +174,14 @@ QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 case "$RESULT_FORMAT" in rows|parquet) ;; *) echo "Invalid --result-format: $RESULT_FORMAT" >&2; exit 1;; esac
 EXPORT_SEQUENCE=0
 emit_result_query() {
+    if [ "$ENGINE" = "sirius" ] && [ -n "${TPCH_QUERY_LABEL_PREFIX:-}" ]; then
+        local label="${TPCH_QUERY_LABEL_PREFIX}_q${q}_iter$((iter + 1))"
+        # Reuse the extraction exclusion brackets so the label CALL contributes no
+        # result table or timer sample to the benchmark query.
+        printf '.print __TPCH_PIN_BEGIN__ label\n.timer off\n'
+        printf "CALL sirius_set_query_label('%s');\n" "${label//\'/\'\'}"
+        printf '.timer on\n.print __TPCH_PIN_END__ label\n'
+    fi
     if [ "$RESULT_FORMAT" = "rows" ]; then
         cat "$QUERY_FILE"
     else
@@ -474,6 +483,15 @@ run_single_session() {
             tc == (n - 1)     { print }
         ' <<< "$SECTION" > "$RESULT_FILE"
 
+        if [ -n "${OUTPUT_DIR:-}" ]; then
+            for ((sample = 1; sample <= NUM_ITERATIONS; sample++)); do
+                awk -v n="$sample" '
+                    /Run Time \(s\):/ { tc++; next }
+                    tc == (n - 1) { print }
+                ' <<< "$SECTION" > "$Q_DIR/result_iter${sample}.txt"
+            done
+        fi
+
         # Extract per-iteration timings.
         local TIMES
         readarray -t TIMES < <(grep -oP 'Run Time \(s\): real \K[0-9]+\.[0-9]+' <<< "$SECTION")
@@ -709,7 +727,7 @@ if [ "$ENGINE" = "sirius" ] && [ "$MULTI_SESSION" = false ] && [ -n "${OUTPUT_DI
         echo "Splitting Sirius log per query (${NUM_ITERATIONS} iterations per query)..."
         readarray -t QB_LINES < <(
             grep -nE 'QueryBegin: (instance=[^ ]+ connection=[^ ]+ query=[^ ]+ )?SQL: ' "$LOG_FILE" \
-                | grep -ivE 'QueryBegin: (instance=[^ ]+ connection=[^ ]+ query=[^ ]+ )?SQL: (CREATE VIEW |LOAD |SET |CALL[[:space:]]+(pin_table|unpin_table))' \
+                | grep -ivE 'QueryBegin: (instance=[^ ]+ connection=[^ ]+ query=[^ ]+ )?SQL: (CREATE VIEW |LOAD |SET |CALL[[:space:]]+(pin_table|unpin_table|sirius_set_query_label))' \
                 | cut -d: -f1
         )
         TOTAL_LOG_LINES=$(wc -l < "$LOG_FILE")

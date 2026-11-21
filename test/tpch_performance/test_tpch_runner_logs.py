@@ -64,7 +64,7 @@ class RunnerLogChecks:
     def query_log(self, query):
         return "".join(self.begin(query, i) + self.complete() for i in (1, 2))
 
-    def run_runner(self, first_day, second_day=None, exit_code=0):
+    def run_runner(self, first_day, second_day=None, exit_code=0, label_prefix=""):
         # Create the newer file first so creation order cannot stand in for dates.
         if second_day is not None:
             (self.logs / "sirius_2026-11-09.log").write_text(second_day)
@@ -81,6 +81,7 @@ class RunnerLogChecks:
             TMPDIR=str(self.temp),
             TPCH_TEST_LOG_DIR=str(self.logs),
             TPCH_TEST_EXIT=str(exit_code),
+            TPCH_QUERY_LABEL_PREFIX=label_prefix,
         )
         result = subprocess.run(
             args, env=env, capture_output=True, text=True, timeout=15
@@ -135,6 +136,24 @@ class RunnerLogChecks:
 
 class ParquetRunnerLogTests(RunnerLogChecks, unittest.TestCase):
     runner_name = "run_tpch_parquet.sh"
+
+    def test_labels_preserve_samples_and_each_result(self):
+        result = self.run_runner(
+            self.query_log(1), self.query_log(2), label_prefix="bench"
+        )
+        self.assert_success(result)
+        sql = (self.output / "all_queries.sql").read_text()
+        self.assertIn("sirius_set_query_label('bench_q1_iter1')", sql)
+        self.assertIn("sirius_set_query_label('bench_q2_iter2')", sql)
+        for query in (1, 2):
+            for iteration in (1, 2):
+                self.assertIn(
+                    "result",
+                    (self.output / f"q{query}/result_iter{iteration}.txt").read_text(),
+                )
+            self.assertEqual(
+                len((self.output / f"q{query}/timings.csv").read_text().splitlines()), 3
+            )
 
     def test_process_failure_is_preserved(self):
         result = self.run_runner(self.query_log(1), self.query_log(2), exit_code=42)

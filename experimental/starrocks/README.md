@@ -70,3 +70,63 @@ fragments, config, and service logs, then stops the processes it started. Existi
 required ports cause it to refuse startup. It does not test multiple GPUs or hosts and does not
 measure comparative performance. The older integration scripts below this directory describe
 the source prototype's historical multi-node runs, not validation of this port.
+
+### Local TPC-H benchmark
+
+The self-contained benchmark adapter uses the same SQL files and per-query timing CSV format as
+`test/tpch_performance/run_tpch_parquet.sh`. Build FE/CN first, then run from the repository root:
+
+```bash
+pixi run --manifest-path experimental/starrocks/pixi.toml -e bench python \
+  test/tpch_performance/run_tpch_starrocks.py \
+  --config /path/to/sirius.yaml \
+  --parquet-dir /home/wmalpica/datasets/tpch_parquet_sf300 \
+  --output-dir /path/to/fresh-run --iterations 2 300
+```
+
+For two compute nodes, add `--devices 0,1` (or two comma-separated MIG UUIDs supported by the
+installed driver and topology discovery). Each CN sees exactly one selected device as CUDA
+device 0. Listener ports, engine logs, fragment dumps, and Quent directories are separate per
+CN; `cluster.json` records the device selectors, configurations, and ports. Host capacity is
+**not divided automatically**: for an aggregate 80-GiB engine-pool budget, supply a configuration
+with `capacity_bytes: 40GiB` when launching two CNs. This limits each engine's host pool, not the
+entire process's resident memory. Regular Sirius can use one shared 80-GiB pool for both devices.
+
+MIG partitions share a physical GPU's compute and memory capacity. Treat two MIG instances as a
+device-partitioning and frontend comparison rather than a doubling of physical resources. First
+verify that CUDA and Sirius enumerate both devices, and smoke-test a cross-CN exchange. CUDA peer
+access within a process does not establish that cross-process CUDA IPC works between MIG GPU
+instances. Preserve the actual UCX transport diagnostics and the UUID-to-selector mapping.
+
+Append query numbers to select a subset. Each query runs twice consecutively in one persistent
+client session and one private FE/CN cluster on GPU 0. Preparation and startup are untimed;
+latency covers submission through complete result retrieval. `--query-timeout` defaults to 1200
+seconds and `--run-timeout` to 7200 seconds. `--explain-only` checks all requested FE plans without
+executing them. A failure ends the attempt and preserves `status.json`; use a new output directory
+for a retry. The adapter never changes an existing cluster or reuses an attempt.
+Use `--continue-on-query-error` for coverage measurements: it saves an error record and `N/A`
+timing for a failed server query, then proceeds if the FE connection and services are alive.
+Timeouts, connection loss, and service exit still stop the attempt. Any query error makes the
+final status `completed_with_errors` and the command exits nonzero; failed-query elapsed time
+is saved separately and never counted as a successful latency.
+
+The output contains private FE state/logs, CN and engine logs, SQL, plans, both iterations' results,
+and `q<N>/timings.csv` with columns `step,runtime_s`. `fragment-index.jsonl` links each query and
+iteration to wall-clock timestamps and newly dumped fragment files; Quent fragment records retain
+their original labels. Enable Quent in the supplied YAML and point its output directory into the
+run directory. The shared q22 uses `SUBSTRING(x FROM n FOR m)`; StarRocks requires the equivalent
+comma spelling. Both `query.sql` and `executed.sql` are saved.
+Q16 uses FE aggregation stage 3 to exchange explicit deduplication keys; the default FE plan's
+opaque partial DISTINCT state is unsupported by this prototype. Other queries use AUTO, and
+`session.sql` records the per-query setting. Pipeline degree and fragment-instance count are 1,
+with `single_node_exec_plan=false` to exercise fragment boundaries on the single CN.
+
+For the regular runner, `TPCH_QUERY_LABEL_PREFIX=baseline` adds untimed per-iteration Quent labels.
+Single-session runs now retain `q<N>/result_iter<I>.txt` as well as the last `result.txt`.
+The existing result comparator supports ordered cross-frontend values with
+`--values-only --actual-format starrocks-json`: integer and decimal values remain exact; only
+floating columns use `--float-tolerance` and `--relative-tolerance`. Run independent DuckDB
+validation after timed measurements so it does not warm the dataset first.
+Boxed CLI output cannot distinguish text whitespace from display padding. For an exact text
+check against the JSON results, also capture the CPU query with DuckDB `-json` and pass that file
+as `--expected-rows-json`; the boxed reference still supplies column types.

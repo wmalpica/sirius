@@ -15,6 +15,7 @@ default = ["fe","cn","client","engine"]
 cn = ["cn"]
 fe = ["fe"]
 client = ["client"]
+bench = ["fe", "client", "bench"]
 engine = ["engine"]
 
 [tasks]
@@ -43,6 +44,11 @@ wait -n "${fe_pid}" "${cn_pid}"
 [feature.client.dependencies]
 # Provides the `mysql` CLI that speaks the FE's MySQL wire protocol on query_port.
 mysql-client = "*"
+
+[feature.bench.dependencies]
+python = "3.11.*"
+pymysql = "1.1.*"
+pyyaml = "6.*"
 
 [feature.client.tasks]
 client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "Open a MySQL client against the local FE (run `cluster` in another terminal first)"}

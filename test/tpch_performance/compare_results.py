@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
+import json
 import math
 import sys
 from dataclasses import dataclass
@@ -117,12 +119,97 @@ def compare_results(
     return True, ""
 
 
+def compare_values(
+    expected: ParsedResult,
+    actual_rows: list[list],
+    float_tolerance: float,
+    relative_tolerance: float = 0.0,
+) -> tuple[bool, str]:
+    """Compare ordered SQL values across frontends with different type/header spellings.
+
+    Integer and decimal values are exact. Floating values use the declared tolerances.
+    The reference's DuckDB types decide which columns are numeric; text containing
+    digits remains text. Both raw schemas should be retained by the caller.
+    """
+    if len(expected.rows) != len(actual_rows):
+        return False, f"row count mismatch: {len(expected.rows)} != {len(actual_rows)}"
+    for row_index, (lhs, rhs) in enumerate(zip(expected.rows, actual_rows)):
+        if len(lhs) != len(rhs):
+            return False, f"row {row_index}: column count mismatch"
+        for column, (reference, value, kind) in enumerate(
+            zip(lhs, rhs, expected.types)
+        ):
+            actual = "NULL" if value is None else str(value)
+            if reference == "NULL" or actual == "NULL":
+                same = reference == actual
+            elif is_float_type(kind):
+                same = math.isclose(
+                    float(reference),
+                    float(actual),
+                    rel_tol=relative_tolerance,
+                    abs_tol=float_tolerance,
+                )
+            elif kind.lower().startswith(
+                (
+                    "decimal",
+                    "tinyint",
+                    "smallint",
+                    "integer",
+                    "bigint",
+                    "hugeint",
+                    "utinyint",
+                    "usmallint",
+                    "uinteger",
+                    "ubigint",
+                    "uhugeint",
+                )
+            ):
+                try:
+                    same = Decimal(reference) == Decimal(actual)
+                except InvalidOperation:
+                    same = False
+            else:
+                same = reference == actual
+            if not same:
+                return (
+                    False,
+                    f"row {row_index} column {column}: {reference!r} != {actual!r} ({kind})",
+                )
+    return True, ""
+
+
+def with_json_rows(reference: ParsedResult, path: Path) -> ParsedResult:
+    """Use DuckDB JSON values to preserve whitespace lost in boxed display padding."""
+    objects = json.loads(path.read_text(), parse_float=Decimal)
+    rows = [
+        ["NULL" if row[name] is None else str(row[name]) for name in reference.headers]
+        for row in objects
+    ]
+    return ParsedResult(reference.headers, reference.types, rows)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare two DuckDB CLI result tables with float tolerance."
     )
     parser.add_argument("expected", type=Path)
     parser.add_argument("actual", type=Path)
+    parser.add_argument(
+        "--expected-rows-json",
+        type=Path,
+        help="untrimmed DuckDB -json rows; column types come from expected boxed result",
+    )
+    parser.add_argument(
+        "--values-only",
+        action="store_true",
+        help="compare ordered values across frontend schemas",
+    )
+    parser.add_argument(
+        "--actual-format",
+        choices=("duckdb-box", "starrocks-json"),
+        default="duckdb-box",
+    )
+    parser.add_argument("--relative-tolerance", type=float, default=0.0)
     parser.add_argument(
         "--float-tolerance",
         type=float,
@@ -133,12 +220,25 @@ def main() -> int:
 
     try:
         expected = parse_result(args.expected)
-        actual = parse_result(args.actual)
+        if args.expected_rows_json:
+            expected = with_json_rows(expected, args.expected_rows_json)
+        if args.actual_format == "starrocks-json":
+            if not args.values_only:
+                parser.error("starrocks-json requires --values-only")
+            actual_rows = json.loads(args.actual.read_text())["rows"]
+        else:
+            actual = parse_result(args.actual)
+            actual_rows = actual.rows
     except Exception as exc:  # pragma: no cover - CLI error path
         print(exc, file=sys.stderr)
         return 2
 
-    match, message = compare_results(expected, actual, args.float_tolerance)
+    if args.values_only:
+        match, message = compare_values(
+            expected, actual_rows, args.float_tolerance, args.relative_tolerance
+        )
+    else:
+        match, message = compare_results(expected, actual, args.float_tolerance)
     if match:
         return 0
 
